@@ -1,11 +1,21 @@
 //! This module defines what a voxel is, etc.
 
+use arrayvec::ArrayVec;
+
 /// Represents a distinct layer of voxel data. Ex: Void, Air, Liquid, Solid, etc.
 ///
 /// Layers that are greater than others will appear on top of lesser ones. Ex: Water will appear on top of solids.
 #[repr(transparent)]
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub struct VoxelLayer(u8);
+
+impl VoxelLayer {
+    /// The highest layer; this layer can not represent a surface.
+    /// Use this for air, space, etc.
+    pub const VOID: Self = Self(u8::MAX);
+    /// The highest layer that forms a surface against [`Self::VOID`].
+    pub const HIGHEST_SURFACE: Self = Self(u8::MAX - 1);
+}
 
 /// Represents a distinct voxel material per layer. Ex: Stone, Dirt, Grass.
 #[repr(transparent)]
@@ -38,7 +48,7 @@ impl VoxelData {
             reason = "This shows what the bits mean."
         )]
         const BASE_VALUE: u32 = 0b_0_01111111_00000000_011111111111111;
-        let fullness_bits = self.0 >> 24;
+        let fullness_bits = self.fullness_bits();
         let result_in_1_to_2 = BASE_VALUE | (fullness_bits << 15);
         f32::from_bits(result_in_1_to_2) - 1.0
     }
@@ -77,5 +87,87 @@ impl VoxelData {
         let layer_bits = layer.0 as u32;
         let mat_bits = material_within_layer.0 as u32;
         Self((fullness_bits << 24) | (mat_bits << 8) | layer_bits)
+    }
+
+    fn fullness_bits(self) -> u32 {
+        self.0 >> 24
+    }
+
+    /// Creates an approximate [`VoxelData`] for this cluster of data.
+    fn approximate(cluster: [Self; 8]) -> Self {
+        let mut highest_layer = VoxelLayer(0);
+        let mut next_highest_layer = VoxelLayer(0);
+
+        let mut num_highest_layer = 0;
+        let mut num_next_highest_layer = 0;
+
+        let mut highest_layer_fullness = 0;
+        let mut next_highest_layer_fullness = 0;
+
+        let mut highest_layer_mats = ArrayVec::<(VoxelMaterial, u8), 8>::new_const();
+        let mut next_highest_layer_mats = ArrayVec::<(VoxelMaterial, u8), 8>::new_const();
+        fn include_mat(mat: VoxelMaterial, mats: &mut ArrayVec<(VoxelMaterial, u8), 8>) {
+            for (m, num) in mats.iter_mut() {
+                if *m == mat {
+                    *num += 1;
+                    return;
+                }
+            }
+            // SAFETY: The capacity of the cluster is known.
+            unsafe {
+                mats.push_unchecked((mat, 0));
+            }
+        }
+
+        for c in cluster {
+            let layer = c.layer();
+            if layer > highest_layer {
+                next_highest_layer = highest_layer;
+                highest_layer = layer;
+                num_next_highest_layer = num_highest_layer;
+                num_highest_layer = 0;
+                next_highest_layer_mats = highest_layer_mats.take();
+            } else if layer > next_highest_layer {
+                next_highest_layer = layer;
+                num_next_highest_layer = 0;
+                next_highest_layer_mats.clear();
+            }
+
+            if layer == highest_layer {
+                num_highest_layer += 1;
+                highest_layer_fullness += c.fullness_bits();
+                include_mat(c.material(), &mut highest_layer_mats);
+            } else if layer == next_highest_layer {
+                num_next_highest_layer += 1;
+                next_highest_layer_fullness += c.fullness_bits();
+                include_mat(c.material(), &mut next_highest_layer_mats);
+            };
+        }
+
+        // The 2 is arbitrary but if we don't do this, a tiny air pocket could consume the whole approximation, all the way up to the root.
+        // But in general, we want to use the average of the highest layer. Ex: in an ocean, distant chunks should not be sand, but water.
+        // If we only used the most common layer, there might be spots of land that didn't actually exist.
+        let (layer, total_fullness, layer_num, mats) = if num_highest_layer > 2 {
+            (
+                highest_layer,
+                highest_layer_fullness,
+                num_highest_layer,
+                highest_layer_mats,
+            )
+        } else {
+            (
+                next_highest_layer,
+                next_highest_layer_fullness,
+                num_next_highest_layer,
+                next_highest_layer_mats,
+            )
+        };
+
+        let mat = mats.into_iter().max_by_key(|i| i.1);
+        // SAFETY: This can't be empty because ultimately we know the cluster is not empty.
+        let mat = unsafe { mat.unwrap_unchecked().0 };
+        let fullness = total_fullness / layer_num;
+
+        Self((fullness << 24) | ((mat.0 as u32) << 8) | layer.0 as u32)
     }
 }
