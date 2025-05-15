@@ -12,7 +12,8 @@ struct ChunkNode {
     /// Stores the index to the ldb child of this node (1 of 8).
     /// The children are stored together in chunk data memory.
     ///
-    /// This may also be a high value for no children.
+    /// This may also be 0 for no children.
+    /// If there are no children, this data is exactly or approximately that of all children.
     ///
     /// # Safety
     ///
@@ -21,22 +22,9 @@ struct ChunkNode {
 }
 
 impl ChunkNode {
-    const NO_CHILDREN_EXACT: u32 = u32::MAX;
-    const NO_CHILDREN_APPROX: u32 = u32::MAX - 1;
-
-    #[inline]
-    fn is_approx(self) -> bool {
-        self.children == Self::NO_CHILDREN_APPROX
-    }
-
-    #[inline]
-    fn is_exact(self) -> bool {
-        self.children == Self::NO_CHILDREN_EXACT
-    }
-
     #[inline]
     fn has_children(self) -> bool {
-        self.children < Self::NO_CHILDREN_APPROX
+        self.children > 0
     }
 }
 
@@ -59,16 +47,30 @@ impl Chunk {
         // SAFETY: This must always be valid.
         let mut node_index = 0;
         while inverse_depth > lod {
+            let px = relative_to_ldb.x & inverse_depth >> (inverse_depth - 1);
+            let py = relative_to_ldb.y & inverse_depth >> (inverse_depth - 1);
+            let pz = relative_to_ldb.z & inverse_depth >> (inverse_depth - 1);
+            let child_offset = px | (py << 1) | (pz << 2);
+            inverse_depth >>= 1;
+
             // SAFETY: node_index is always valid.
             let node = unsafe { self.data.get_unchecked_mut(node_index) };
 
             let children_index = if !node.has_children() {
+                if node.voxel == voxel {
+                    // There are no children so this node is the best approximation of the voxel data we want to set.
+                    // But they match, so it's exact. Why make it more specific?
+                    return;
+                }
+
+                // Ok, we do need to be more specific.
+                // But so far, the node's data has been accurate or at least is the best available approximation for child nodes.
+                // So we can just copy its data for the children.
                 let child_data = *node;
                 let children_index = self.data.len();
                 for _ in 0..8 {
                     self.data.push(child_data);
                 }
-
                 // SAFETY: node_index is always valid.
                 let node = unsafe { self.data.get_unchecked_mut(node_index) };
                 node.children = children_index as u32;
@@ -77,12 +79,6 @@ impl Chunk {
             } else {
                 node.children as usize
             };
-
-            let px = relative_to_ldb.x & inverse_depth >> (inverse_depth - 1);
-            let py = relative_to_ldb.y & inverse_depth >> (inverse_depth - 1);
-            let pz = relative_to_ldb.z & inverse_depth >> (inverse_depth - 1);
-            let child_offset = px | (py << 1) | (pz << 2);
-            inverse_depth >>= 1;
 
             // SAFETY: These indices are correct
             node_index = children_index + child_offset as usize;

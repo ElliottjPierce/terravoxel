@@ -1,4 +1,4 @@
-//! Contains logic for what a terrain world is.
+//! Contains logic for what a terrain may look like.
 
 use bevy_math::IVec3;
 
