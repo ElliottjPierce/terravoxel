@@ -1,0 +1,20 @@
+[files]
+extend-exclude = [
+  "*.pbxproj", # metadata file
+  "*.patch",   # Automatically generated files that should not be manually modified.
+  "*.bin",     # Binary files
+  ".git/",     # Version control files
+]
+ignore-hidden = false
+
+# Match Inside a Word - Case Insensitive
+[default.extend-words]
+LOD = "LOD" # Level of detail
+
+# Match a Whole Word - Case Sensitive
+[default.extend-identifiers]
+ser = "ser" # ron::ser - Serializer
+Pn = "Pn"
+
+[default]
+locale = "en-us"
