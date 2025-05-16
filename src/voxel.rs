@@ -22,6 +22,55 @@ impl VoxelLayer {
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub struct VoxelMaterial(u16);
 
+/// Represents how full a voxel is with a quantized [`u8`].
+/// This "fullness" is mainly about how close this voxel is to the nearest higher layer surface.
+///
+/// The voxel is always at least half full; otherwise it would have a different material.
+/// So this fullness value from 0 to 1, really represents a range from 0.5 to 1 (Ex: 0.5 means 75% full).
+/// For example, a grass voxel near air that is 25% grass and 75% air gets an air material and a fullness of 0.5.
+///
+/// Note that when determining where a surface is between two voxels,
+/// it is at the position of the lower layer voxel,
+/// lerped to the position of the higher layer voxel,
+/// by the fullness of the lower layer voxel.
+///
+/// As an example, imagine an air voxel followed by two dirt voxels.
+/// The air voxel is 100% full since there is no layer above it.
+/// The first dirt voxel may be 75% full, and the next one 100% since it is deeper than the first.
+/// As the first dirt voxel is dug out, it's fullness drops to 70%, 65%, etc, and eventually hits 50%, where the surface now goes directly though the center of the first dirt voxel.
+/// As it is dips bellow 50%, it switches immediately to a 100% full air voxel.
+/// But because the dirt voxel beneath it is 100% full, the surface's location has barely moved.
+/// As the second dirt voxel is dug more, the fullness decreases, moving from the center of the first dirt voxel, to the center of the second one.
+#[repr(transparent)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+pub struct VoxelFullness(u8);
+
+impl VoxelFullness {
+    /// Gets the fullness from 0 to 1, 0 meaning 50% full and 1 meaning 100% full.
+    /// You can think of this as the distance to the nearest higher layer surface scaled to the diameter of the voxel, and clamped to (0, 1).
+    pub fn fullness_unorm(self) -> f32 {
+        /// The base value bits for the floats we make.
+        /// Positive sign, exponent of 0    , 8 value bits    15 bits as precision padding.
+        #[expect(
+            clippy::unusual_byte_groupings,
+            reason = "This shows what the bits mean."
+        )]
+        const BASE_VALUE: u32 = 0b_0_01111111_00000000_011111111111111;
+        let result_in_1_to_2 = BASE_VALUE | ((self.0 as u32) << 15);
+        f32::from_bits(result_in_1_to_2) - 1.0
+    }
+
+    /// Gets the fullness as a percent between 0 and 1, 0 meaning 0% full and 1 meaning 100% full.
+    pub fn fullness_percent(self) -> f32 {
+        self.fullness_unorm() * 0.5 + 0.5
+    }
+
+    /// Gets the fullness between 0 and 255, 0 meaning 50% full and 255 meaning 100% full.
+    pub fn fullness_quantized(self) -> u8 {
+        self.0
+    }
+}
+
 /// Voxel data specifies what a voxel is in a few ways:
 /// Every voxel has a material (ex: grass), fullness (ex: 75%), and a layer (ex: solid).
 ///
@@ -35,22 +84,9 @@ pub struct VoxelMaterial(u16);
 pub struct VoxelData(u32);
 
 impl VoxelData {
-    /// Gets the fullness of this voxel.
-    ///
-    /// The voxel is always at least half full; otherwise it would have a different material.
-    /// So this fullness value from 0 to 1, really represents a range from 0.5 to one (Ex: 0.5 means 75% full).
-    /// For example, a grass voxel near air that is 25% grass and 75% air gets an air material and a fullness of 0.5.
-    pub fn fullness(self) -> f32 {
-        /// The base value bits for the floats we make.
-        /// Positive sign, exponent of 0    , 8 value bits    15 bits as precision padding.
-        #[expect(
-            clippy::unusual_byte_groupings,
-            reason = "This shows what the bits mean."
-        )]
-        const BASE_VALUE: u32 = 0b_0_01111111_00000000_011111111111111;
-        let fullness_bits = self.fullness_bits();
-        let result_in_1_to_2 = BASE_VALUE | (fullness_bits << 15);
-        f32::from_bits(result_in_1_to_2) - 1.0
+    /// Gets the [`VoxelFullness`] of the voxel.
+    pub fn fullness(self) -> VoxelFullness {
+        VoxelFullness((self.0 >> 24) as u8)
     }
 
     /// Gets the [`VoxelLayer`] of the voxel.
@@ -87,10 +123,6 @@ impl VoxelData {
         let layer_bits = layer.0 as u32;
         let mat_bits = material_within_layer.0 as u32;
         Self((fullness_bits << 24) | (mat_bits << 8) | layer_bits)
-    }
-
-    fn fullness_bits(self) -> u32 {
-        self.0 >> 24
     }
 
     /// Creates an approximate [`VoxelData`] for this cluster of data.
@@ -135,11 +167,11 @@ impl VoxelData {
 
             if layer == highest_layer {
                 num_highest_layer += 1;
-                highest_layer_fullness += c.fullness_bits();
+                highest_layer_fullness += c.0 >> 24;
                 include_mat(c.material(), &mut highest_layer_mats);
             } else if layer == next_highest_layer {
                 num_next_highest_layer += 1;
-                next_highest_layer_fullness += c.fullness_bits();
+                next_highest_layer_fullness += c.0 >> 24;
                 include_mat(c.material(), &mut next_highest_layer_mats);
             };
         }
