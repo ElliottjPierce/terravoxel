@@ -1,5 +1,7 @@
 //! This module defines what a voxel is, etc.
 
+use core::fmt::{Debug, Formatter};
+
 use arrayvec::ArrayVec;
 
 /// Represents a distinct layer of voxel data. Ex: Void, Air, Liquid, Solid, etc.
@@ -17,9 +19,9 @@ pub struct VoxelLayer(u8);
 impl VoxelLayer {
     /// The highest layer; this layer can not represent a surface.
     /// Use this for air, space, etc.
-    pub const VOID: Self = Self(u8::MAX);
+    pub const VOID: Self = Self(0x7f);
     /// The highest layer that forms a surface against [`Self::VOID`].
-    pub const HIGHEST_SURFACE: Self = Self(u8::MAX - 1);
+    pub const HIGHEST_SURFACE: Self = Self(Self::VOID.0 - 1);
 
     /// Constructs the layer from a `u32` if the layer is within range.
     pub const fn from_u32(layer: u32) -> Option<VoxelLayer> {
@@ -27,6 +29,21 @@ impl VoxelLayer {
             None
         } else {
             Some(Self(layer as u8))
+        }
+    }
+
+    /// Gets the layer as a `u32` id/index.
+    pub const fn index(self) -> u32 {
+        self.0 as u32
+    }
+}
+
+impl Debug for VoxelLayer {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        if *self == Self::VOID {
+            f.write_str("Void")
+        } else {
+            write!(f, "LayerId={}", self.index())
         }
     }
 }
@@ -44,6 +61,17 @@ impl VoxelMaterial {
         } else {
             Some(Self(material as u16))
         }
+    }
+
+    /// Gets the material as a `u32` id/index.
+    pub const fn index(self) -> u32 {
+        self.0 as u32
+    }
+}
+
+impl Debug for VoxelMaterial {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        write!(f, "MaterialId={}", self.index())
     }
 }
 
@@ -98,6 +126,17 @@ impl VoxelFullness {
     }
 }
 
+impl Debug for VoxelFullness {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{} ({})",
+            self.fullness_quantized(),
+            self.fullness_percent()
+        )
+    }
+}
+
 /// Voxel data specifies what a voxel is in a few ways:
 /// Every voxel has a material (ex: grass), fullness (ex: 75%), and a layer (ex: solid).
 ///
@@ -107,8 +146,8 @@ impl VoxelFullness {
 ///
 /// Internally, this is stored, in order of most to least significant, as:
 ///
+/// - 1 skipped bit, (for flags elsewhere but *always* off here)
 /// - 7 layer bits, (so it can be accessed with one bit shift)
-/// - 1 skipped bit, (for flags elsewher but always off here)
 /// - 16 material bits, (since it's the least accessed)
 /// - 8 fullness bits. (since it can be accessed with one bit and)
 #[repr(transparent)]
@@ -116,8 +155,8 @@ impl VoxelFullness {
 pub struct VoxelData(u32);
 
 impl VoxelData {
-    const RESERVED_BIT: u32 = 1 << 24;
-    const LAYER_SHIFT: u32 = 25;
+    const RESERVED_BIT: u32 = 1 << 31;
+    const LAYER_SHIFT: u32 = 24;
     const MAT_SHIFT: u32 = 8;
     const FULLNESS_BITS: u32 = 0xFF;
 
@@ -207,7 +246,7 @@ impl VoxelData {
             }
             // SAFETY: The capacity of the cluster is known.
             unsafe {
-                mats.push_unchecked((mat, 0));
+                mats.push_unchecked((mat, 1));
             }
         }
 
@@ -219,9 +258,12 @@ impl VoxelData {
                 num_next_highest_layer = num_highest_layer;
                 num_highest_layer = 0;
                 next_highest_layer_mats = highest_layer_mats.take();
-            } else if layer > next_highest_layer {
+                next_highest_layer_fullness = highest_layer_fullness;
+                highest_layer_fullness = 0;
+            } else if layer > next_highest_layer && layer < highest_layer {
                 next_highest_layer = layer;
                 num_next_highest_layer = 0;
+                next_highest_layer_fullness = 0;
                 next_highest_layer_mats.clear();
             }
 
@@ -262,5 +304,70 @@ impl VoxelData {
         let fullness = total_fullness / layer_num;
 
         Self::new_by_bits(layer.0 as u32, mat.0 as u32, fullness)
+    }
+}
+
+impl Debug for VoxelData {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "VoxelData {{ layer: {0:?}, material: {1:?}, fullness: {2:?}, }}",
+            self.layer(),
+            self.material(),
+            self.fullness()
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_bits() {
+        let layer = 123;
+        let mat = 19873;
+        let fullness = 127;
+
+        let voxel = VoxelData::new(
+            VoxelLayer::from_u32(layer).unwrap(),
+            VoxelMaterial::from_u32(mat).unwrap(),
+            VoxelFullness(fullness),
+        );
+        let voxel_bits = voxel.to_bits();
+        assert_eq!(voxel, VoxelData::from_bits(voxel_bits).unwrap());
+
+        assert_eq!(voxel.fullness().fullness_quantized(), fullness);
+        assert_eq!(voxel.material().index(), mat);
+        assert_eq!(voxel.layer().index(), layer);
+    }
+
+    #[test]
+    fn reasonable_estimate() {
+        let voxels = [
+            VoxelData::new_by_bits(1, 2, 200),
+            VoxelData::new_by_bits(4, 0, 125),
+            VoxelData::new_by_bits(4, 1, 50),
+            VoxelData::new_by_bits(4, 1, 200),
+            VoxelData::new_by_bits(4, 1, 100),
+            VoxelData::new_by_bits(4, 2, 75),
+            VoxelData::new_by_bits(6, 1, 200),
+            VoxelData::new_by_bits(6, 1, 200),
+        ];
+        let estimate = VoxelData::approximate(voxels);
+        assert_eq!(estimate, VoxelData::new_by_bits(4, 1, 110));
+
+        let voxels = [
+            VoxelData::new_by_bits(4, 0, 255),
+            VoxelData::new_by_bits(1, 2, 255),
+            VoxelData::new_by_bits(4, 1, 255),
+            VoxelData::new_by_bits(6, 1, 255),
+            VoxelData::new_by_bits(4, 1, 255),
+            VoxelData::new_by_bits(4, 1, 255),
+            VoxelData::new_by_bits(4, 2, 255),
+            VoxelData::new_by_bits(6, 1, 255),
+        ];
+        let estimate = VoxelData::approximate(voxels);
+        assert_eq!(estimate, VoxelData::new_by_bits(4, 1, 255));
     }
 }
