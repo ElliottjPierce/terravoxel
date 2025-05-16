@@ -4,6 +4,11 @@ use arrayvec::ArrayVec;
 
 /// Represents a distinct layer of voxel data. Ex: Void, Air, Liquid, Solid, etc.
 ///
+/// Only 7 bits may represent this value,
+/// and the highest layer [`VOID`](Self::VOID) doesn't correspond to a surface.
+/// That gives 128 layers and 127 surfaces.
+/// This is represented internally as a [`u8`] where the highest bit is always off.
+///
 /// Layers that are greater than others will appear on top of lesser ones. Ex: Water will appear on top of solids.
 #[repr(transparent)]
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
@@ -15,12 +20,32 @@ impl VoxelLayer {
     pub const VOID: Self = Self(u8::MAX);
     /// The highest layer that forms a surface against [`Self::VOID`].
     pub const HIGHEST_SURFACE: Self = Self(u8::MAX - 1);
+
+    /// Constructs the layer from a `u32` if the layer is within range.
+    pub const fn from_u32(layer: u32) -> Option<VoxelLayer> {
+        if layer > 0x7f {
+            None
+        } else {
+            Some(Self(layer as u8))
+        }
+    }
 }
 
 /// Represents a distinct voxel material per layer. Ex: Stone, Dirt, Grass.
 #[repr(transparent)]
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub struct VoxelMaterial(u16);
+
+impl VoxelMaterial {
+    /// Constructs the material from a `u32` id if the id is within range.
+    pub const fn from_u32(material: u32) -> Option<VoxelMaterial> {
+        if material > 0xFFFF {
+            None
+        } else {
+            Some(Self(material as u16))
+        }
+    }
+}
 
 /// Represents how full a voxel is with a quantized [`u8`].
 /// This "fullness" is mainly about how close this voxel is to the nearest higher layer surface.
@@ -48,7 +73,8 @@ pub struct VoxelFullness(u8);
 impl VoxelFullness {
     /// Gets the fullness from 0 to 1, 0 meaning 50% full and 1 meaning 100% full.
     /// You can think of this as the distance to the nearest higher layer surface scaled to the diameter of the voxel, and clamped to (0, 1).
-    pub fn fullness_unorm(self) -> f32 {
+    #[inline]
+    pub const fn fullness_unorm(self) -> f32 {
         /// The base value bits for the floats we make.
         /// Positive sign, exponent of 0    , 8 value bits    15 bits as precision padding.
         #[expect(
@@ -61,12 +87,13 @@ impl VoxelFullness {
     }
 
     /// Gets the fullness as a percent between 0 and 1, 0 meaning 0% full and 1 meaning 100% full.
-    pub fn fullness_percent(self) -> f32 {
+    pub const fn fullness_percent(self) -> f32 {
         self.fullness_unorm() * 0.5 + 0.5
     }
 
     /// Gets the fullness between 0 and 255, 0 meaning 50% full and 255 meaning 100% full.
-    pub fn fullness_quantized(self) -> u8 {
+    #[inline]
+    pub const fn fullness_quantized(self) -> u8 {
         self.0
     }
 }
@@ -78,51 +105,84 @@ impl VoxelFullness {
 /// the average data for a group of voxels, or the exact data for a group of voxels.
 /// When it represents an exact voxel, it represents the data of the center of that voxel.
 ///
-/// Internally, this is stored as 8 fullness bits, 16 material, and 8 layer bits in order of most to least significant.
+/// Internally, this is stored, in order of most to least significant, as:
+///
+/// - 7 layer bits, (so it can be accessed with one bit shift)
+/// - 1 skipped bit, (for flags elsewher but always off here)
+/// - 16 material bits, (since it's the least accessed)
+/// - 8 fullness bits. (since it can be accessed with one bit and)
 #[repr(transparent)]
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub struct VoxelData(u32);
 
 impl VoxelData {
+    const RESERVED_BIT: u32 = 1 << 24;
+    const LAYER_SHIFT: u32 = 25;
+    const MAT_SHIFT: u32 = 8;
+    const FULLNESS_BITS: u32 = 0xFF;
+
     /// Gets the [`VoxelFullness`] of the voxel.
-    pub fn fullness(self) -> VoxelFullness {
-        VoxelFullness((self.0 >> 24) as u8)
+    #[inline]
+    pub const fn fullness(self) -> VoxelFullness {
+        VoxelFullness(self.0 as u8)
     }
 
     /// Gets the [`VoxelLayer`] of the voxel.
-    pub fn layer(self) -> VoxelLayer {
-        VoxelLayer(self.0 as u8)
+    #[inline]
+    pub const fn layer(self) -> VoxelLayer {
+        VoxelLayer((self.0 >> Self::LAYER_SHIFT) as u8)
     }
 
     /// Gets the [`VoxelMaterial`] of the voxel.
-    pub fn material(self) -> VoxelMaterial {
-        VoxelMaterial((self.0 >> 8) as u16)
+    #[inline]
+    pub const fn material(self) -> VoxelMaterial {
+        VoxelMaterial((self.0 >> Self::MAT_SHIFT) as u16)
     }
 
     /// Gets the raw bits of this voxel data.
-    pub fn to_bits(self) -> u32 {
+    #[inline]
+    pub const fn to_bits(self) -> u32 {
         self.0
     }
 
     /// Constructs a [`VoxelData`] from its bits.
-    /// All bits are valid.
-    pub fn from_bits(bits: u32) -> Self {
-        Self(bits)
+    /// If the bits are not valid, this returns `None`.
+    #[inline]
+    pub const fn from_bits(bits: u32) -> Option<Self> {
+        if bits & Self::RESERVED_BIT > 0 {
+            None
+        } else {
+            Some(Self(bits))
+        }
+    }
+
+    /// Constructs a [`VoxelData`] from its parts. Keep in mind that the material is per layer.
+    #[inline]
+    pub const fn new(layer: VoxelLayer, mat: VoxelMaterial, fullness: VoxelFullness) -> Self {
+        Self::new_by_bits(layer.0 as u32, mat.0 as u32, fullness.0 as u32)
+    }
+
+    /// Constructs a [`VoxelData`] from its parts, where each part is in raw `u32` format, within the right number of bits and in the least significant bits.
+    #[inline]
+    const fn new_by_bits(layer_bits: u32, mat_bits: u32, fullness_bits: u32) -> Self {
+        Self((layer_bits << Self::LAYER_SHIFT) | (mat_bits << Self::MAT_SHIFT) | fullness_bits)
     }
 
     /// Constructs a [`VoxelData`] given its layer, material within that layer, inverse radius (reciprocal), and distance to the nearest surface of the upper layer.
     /// The distance and radius are assumed to be positive.
-    pub fn from_surface_distance(
+    pub const fn from_surface_distance(
         distance_to_upper_surface: f32,
-        inverse_radius_of_voxel: f32,
+        inverse_diameter_of_voxel: f32,
         layer: VoxelLayer,
         material_within_layer: VoxelMaterial,
     ) -> Self {
-        let fullness = (distance_to_upper_surface * inverse_radius_of_voxel).min(1.0);
+        let fullness = (distance_to_upper_surface * inverse_diameter_of_voxel).min(1.0);
         let fullness_bits = (fullness * 255.0) as u32;
-        let layer_bits = layer.0 as u32;
-        let mat_bits = material_within_layer.0 as u32;
-        Self((fullness_bits << 24) | (mat_bits << 8) | layer_bits)
+        Self::new_by_bits(
+            layer.0 as u32,
+            material_within_layer.0 as u32,
+            fullness_bits,
+        )
     }
 
     /// Creates an approximate [`VoxelData`] for this cluster of data.
@@ -167,11 +227,11 @@ impl VoxelData {
 
             if layer == highest_layer {
                 num_highest_layer += 1;
-                highest_layer_fullness += c.0 >> 24;
+                highest_layer_fullness += c.0 & Self::FULLNESS_BITS;
                 include_mat(c.material(), &mut highest_layer_mats);
             } else if layer == next_highest_layer {
                 num_next_highest_layer += 1;
-                next_highest_layer_fullness += c.0 >> 24;
+                next_highest_layer_fullness += c.0 & Self::FULLNESS_BITS;
                 include_mat(c.material(), &mut next_highest_layer_mats);
             };
         }
@@ -198,8 +258,9 @@ impl VoxelData {
         let mat = mats.into_iter().max_by_key(|i| i.1);
         // SAFETY: This can't be empty because ultimately we know the cluster is not empty.
         let mat = unsafe { mat.unwrap_unchecked().0 };
+        // This can't overflow beyond a u8 since it is an average.
         let fullness = total_fullness / layer_num;
 
-        Self((fullness << 24) | ((mat.0 as u32) << 8) | layer.0 as u32)
+        Self::new_by_bits(layer.0 as u32, mat.0 as u32, fullness)
     }
 }
