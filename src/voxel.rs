@@ -160,6 +160,17 @@ impl VoxelData {
     const MAT_SHIFT: u32 = 8;
     const FULLNESS_BITS: u32 = 0xFF;
 
+    /// Checks if the reserved bit is on in these `bits`.
+    /// If so, this will need to be turned off before making a [`VoxelData`].
+    pub(crate) fn is_reserved_bit_on(bits: u32) -> bool {
+        bits & Self::RESERVED_BIT > 0
+    }
+
+    /// Turns on the reserved bit is on in these `bits`.
+    pub(crate) fn with_reserved_bit_on(bits: u32) -> u32 {
+        bits | Self::RESERVED_BIT
+    }
+
     /// Gets the [`VoxelFullness`] of the voxel.
     #[inline]
     pub const fn fullness(self) -> VoxelFullness {
@@ -193,6 +204,13 @@ impl VoxelData {
         } else {
             Some(Self(bits))
         }
+    }
+
+    /// Constructs a [`VoxelData`] from its bits.
+    /// If the bits are invalid, this simply makes them valid.
+    #[inline]
+    pub const fn force_from_bits(bits: u32) -> Self {
+        Self(bits & !Self::RESERVED_BIT)
     }
 
     /// Constructs a [`VoxelData`] from its parts. Keep in mind that the material is per layer.
