@@ -155,6 +155,7 @@ impl Debug for VoxelFullness {
 pub struct VoxelData(u32);
 
 impl VoxelData {
+    pub(crate) const PLACEHOLDER: Self = Self(0);
     pub(crate) const RESERVED_BIT: u32 = 1 << 31;
     const LAYER_SHIFT: u32 = 24;
     const MAT_SHIFT: u32 = 8;

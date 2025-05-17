@@ -1,6 +1,6 @@
 //! Contains the logic for specifying bulk [`VoxelData`].
 
-use core::num::NonZero;
+use core::{num::NonZero, u32};
 
 use bevy_math::IVec3;
 use bevy_platform::prelude::*;
@@ -39,6 +39,8 @@ impl Lod {
 /// - The [`VoxelData`] that best represents the children via [`VoxelData::approximate`],
 /// - Whether or not that [`VoxelData`] approximation is up to date (It's a useful cache, but we only update it as needed),
 /// - The index of the first of the 8 children, which will be stored next to each other.
+///
+/// This can also represent a "free" node, which is void and pending reuse.
 #[derive(PartialEq, Eq, Clone, Copy)]
 struct ChunkNode {
     /// The voxel data for this cube.
@@ -58,9 +60,11 @@ struct ChunkNode {
     /// - 1 bit for if the [`VoxelData`] has been dirtied or not (If it has, we will need to redo [`VoxelData::approximate`]),
     /// - 6 bits currently unused,
     ///
+    /// If this is nod a node and is "free", this just stores the index to the next free node, or 0 if there is no free node.
+    ///
     /// # Safety
     ///
-    /// To speed up indexing, child indices must be correct.
+    /// To speed up indexing, child and free indices must be correct.
     meta: u32,
 }
 
@@ -69,6 +73,13 @@ impl ChunkNode {
     const DIRTY_BIT: u32 = 1 << 31;
     const EXACTNESS_SHIFT: u32 = 28;
     const EXACTNESS_BITS: u32 = 0b1111 << Self::EXACTNESS_SHIFT;
+
+    /// Since this is a tree, we never iterate the chunk's list, but there are sometimes gaps.
+    /// This is a dummy value that can be used as a placeholder.
+    const PLACEHOLDER: Self = Self {
+        voxel_data: VoxelData::PLACEHOLDER,
+        meta: u32::MAX,
+    };
 
     /// Gets the index of the first of 8 children (stored densely) if it is a parent node.
     #[inline]
@@ -127,25 +138,38 @@ impl ChunkNode {
     }
 }
 
-union ChunkSlot {
-    free_and_next_free: u32,
-    full_and_node: ChunkNode,
-    uninit: (),
+/// Represents a octree of [`ChunkNode`]s.
+///
+/// # Safety
+///
+/// This must always have the root node at index 0.
+struct ChunkTree(Vec<ChunkNode>);
+
+impl ChunkTree {
+    const CHUNK_NODE_DEPTH: u32 = Lod::MAX.0 as u32;
+
+    /// Compresses this chunk data into a very dense form.
+    /// This is mainly used for serialization, but is generally useful for compressing data as needed.
+    pub fn compress<O>(&self) -> Vec<u8> {
+        todo!()
+    }
+
+    /// Expands chunk data from a very dense form.
+    /// This is mainly used for deserialization, but is generally useful for restoring [`Self::compress`]ed data as needed.
+    pub fn expand(compressed: &[u8]) -> Self {
+        todo!()
+    }
 }
 
-/// Represents a cubic block of [`VoxelData`] primed for mutation and ready approximation.
+/// Represents a cubic block of [`VoxelData`].
 pub struct Chunk {
     ldb_loc: IVec3,
-    /// # Safety
-    ///
-    /// This must always have the root node at index 0.
-    data: Vec<ChunkSlot>,
+    tree: ChunkTree,
 }
 
 impl Chunk {
     /// This is the length of the cube that the [`Chunk`] represents.
     pub const CHUNK_SIZE: u32 = Lod::MAX.length();
-    const CHUNK_NODE_DEPTH: u32 = Lod::MAX.0 as u32;
 }
 
 #[cfg(test)]
@@ -154,7 +178,7 @@ mod tests {
 
     #[test]
     fn chunk_children_bits() {
-        let total_possible_nodes: u32 = (0..=Chunk::CHUNK_NODE_DEPTH).map(|l| 8u32.pow(l)).sum();
+        let total_possible_nodes: u32 = (0..=Lod::MAX.0).map(|l| 8u32.pow(l as u32)).sum();
         // The child index must only ever take 25 bits.
         assert!(total_possible_nodes < 2u32.pow(25));
     }
