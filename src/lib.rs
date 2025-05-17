@@ -5,6 +5,4 @@
 #![no_std]
 #![doc = include_str!("../README.md")]
 
-pub mod chunk;
-pub mod volume;
-pub mod voxel;
+pub mod storage;
