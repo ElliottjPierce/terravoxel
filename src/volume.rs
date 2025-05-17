@@ -1,72 +1,29 @@
-//! Contains the logic for specifying bulk [`VoxelData`].
+//! Contains the logic for specifying collections of [`Chunk`]s
 
-use bevy_math::{IVec3, UVec3};
+use bevy_math::IVec3;
+use bevy_platform::collections::HashMap;
 
-use crate::voxel::VoxelData;
+use crate::chunk::Chunk;
 
-/// To save memory we store [`VoxelData`] in a sparse tree per chunk.
-/// This is a node in that tree.
+/// Represents a collection of [`Chunk`]s and how to mutate them.
+/// All data is specified externally and arbitrarily.
+/// This allows the volume to treat data sources from network, disk, procedural generators, and player interaction in the same way.
 ///
-/// Each node may or may not have children and may or may not be exact.
+/// Data is never cloned.
+/// The [`Chunk`]s are always readable, but may not always be exclusive;
+/// Some chunks may be being poligonized or be shipped to some other async task.
+/// When a mutation is made, if the chunk is available, it is made directly.
+/// Otherwise, it is queued to be mutated when the chunk next becomes available.
 ///
-/// | children? |is exact| is not exact |
-/// |---|---|---|
-/// | has children | This is the average/representative of some children data. | This is a guess of this data, but children may be more precise. |
-/// | has no children | This is the data of all would-be children. | This is the best available guess of all would-be children; more samples should be made as needed. |
+/// Chunks can be inserted and removed freely.
+/// Readonly access to a chunk may also be freely requested.
+/// This allows saving and loading chunk data arbitrarily.
+/// This can also, on paper, be used for physics collision detection with the terrain.
 ///
-#[derive(PartialEq, Eq, Clone, Copy)]
-struct ChunkNode {
-    /// Represents some [`VoxelData`] if the high bit is on, this is only an approximation/guess.
-    /// Otherwise, this is exact.
-    voxel_data: u32,
-    /// Stores the index to the ldb child of this node (1 of 8).
-    /// The children are stored together in chunk data memory.
-    ///
-    /// This may also be 0 for no children.
-    /// If there are no children, this data is exactly or approximately that of all children.
-    ///
-    /// # Safety
-    ///
-    /// This index must be correct.
-    children: u32,
-}
-
-impl ChunkNode {
-    #[inline]
-    fn has_children(self) -> bool {
-        self.children > 0
-    }
-
-    #[inline]
-    fn is_approximate(self) -> bool {
-        VoxelData::is_reserved_bit_on(self.voxel_data)
-    }
-
-    #[inline]
-    fn voxel(self) -> VoxelData {
-        VoxelData::force_from_bits(self.voxel_data)
-    }
-
-    #[inline]
-    fn set_voxel_data(&mut self, data: VoxelData, is_approximate: bool) {
-        let bits = data.to_bits();
-        if is_approximate {
-            self.voxel_data = VoxelData::with_reserved_bit_on(bits);
-        } else {
-            self.voxel_data = bits;
-        }
-    }
-}
-
-struct Chunk {
-    ldb_loc: IVec3,
-    /// # Safety
-    ///
-    /// This must always have the root node at index 0.
-    data: Vec<ChunkNode>,
-}
-
-impl Chunk {
-    const CHUNK_SIZE: u32 = 1 << Self::CHUNK_NODE_DEPTH;
-    const CHUNK_NODE_DEPTH: u32 = 8;
+/// Finally, meshes can be generated for regions of the volume that are loaded, at varying degrees of detail, quality, etc.
+/// This is a long process that requires holding onto relevant chunk information, which would cause mutations to be queued.
+/// Allowing arbitrary meshes to be constructed like this empowers configuring caching, quality, and speed of mesh generation.
+pub struct Volume {
+    chunks: HashMap<IVec3, Chunk>,
+    // changes: tbd
 }
