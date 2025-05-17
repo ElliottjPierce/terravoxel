@@ -155,21 +155,10 @@ impl Debug for VoxelFullness {
 pub struct VoxelData(u32);
 
 impl VoxelData {
-    const RESERVED_BIT: u32 = 1 << 31;
+    pub(crate) const RESERVED_BIT: u32 = 1 << 31;
     const LAYER_SHIFT: u32 = 24;
     const MAT_SHIFT: u32 = 8;
     const FULLNESS_BITS: u32 = 0xFF;
-
-    /// Checks if the reserved bit is on in these `bits`.
-    /// If so, this will need to be turned off before making a [`VoxelData`].
-    pub(crate) fn is_reserved_bit_on(bits: u32) -> bool {
-        bits & Self::RESERVED_BIT > 0
-    }
-
-    /// Turns on the reserved bit is on in these `bits`.
-    pub(crate) fn with_reserved_bit_on(bits: u32) -> u32 {
-        bits | Self::RESERVED_BIT
-    }
 
     /// Gets the [`VoxelFullness`] of the voxel.
     #[inline]
@@ -204,6 +193,14 @@ impl VoxelData {
         } else {
             Some(Self(bits))
         }
+    }
+
+    /// Constructs a [`VoxelData`] from these bits.
+    /// This does not validate the bits.
+    /// Passing incorrect bits does not produce UB, but is a nasty logic error.
+    #[inline]
+    pub const fn from_bits_unchecked(bits: u32) -> Self {
+        Self(bits)
     }
 
     /// Constructs a [`VoxelData`] from its bits.

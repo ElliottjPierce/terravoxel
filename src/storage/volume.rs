@@ -3,7 +3,7 @@
 use bevy_math::IVec3;
 use bevy_platform::collections::HashMap;
 
-use crate::chunk::Chunk;
+use crate::storage::chunk::Chunk;
 
 /// Represents a collection of [`Chunk`]s and how to mutate them.
 /// All data is specified externally and arbitrarily.
