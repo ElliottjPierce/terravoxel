@@ -38,11 +38,7 @@ impl Lod {
 ///
 /// - The [`VoxelData`] that best represents the children via [`VoxelData::approximate`],
 /// - Whether or not that [`VoxelData`] approximation is up to date (It's a useful cache, but we only update it as needed),
-/// - The index of the first of the 8 children, which will be stored next to eachother.
-///
-/// # Safety
-///
-/// To speed up indexing, node indices must be correct.
+/// - The index of the first of the 8 children, which will be stored next to each other.
 #[derive(PartialEq, Eq, Clone, Copy)]
 struct ChunkNode {
     /// The voxel data for this cube.
@@ -61,6 +57,10 @@ struct ChunkNode {
     ///
     /// - 1 bit for if the [`VoxelData`] has been dirtied or not (If it has, we will need to redo [`VoxelData::approximate`]),
     /// - 6 bits currently unused,
+    ///
+    /// # Safety
+    ///
+    /// To speed up indexing, child indices must be correct.
     meta: u32,
 }
 
@@ -127,13 +127,19 @@ impl ChunkNode {
     }
 }
 
+union ChunkSlot {
+    free_and_next_free: u32,
+    full_and_node: ChunkNode,
+    uninit: (),
+}
+
 /// Represents a cubic block of [`VoxelData`] primed for mutation and ready approximation.
 pub struct Chunk {
     ldb_loc: IVec3,
     /// # Safety
     ///
     /// This must always have the root node at index 0.
-    data: Vec<ChunkNode>,
+    data: Vec<ChunkSlot>,
 }
 
 impl Chunk {
@@ -150,6 +156,6 @@ mod tests {
     fn chunk_children_bits() {
         let total_possible_nodes: u32 = (0..=Chunk::CHUNK_NODE_DEPTH).map(|l| 8u32.pow(l)).sum();
         // The child index must only ever take 25 bits.
-        assert!(total_possible_nodes < 2u32.pow(25))
+        assert!(total_possible_nodes < 2u32.pow(25));
     }
 }
