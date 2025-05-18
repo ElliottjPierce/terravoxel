@@ -148,11 +148,50 @@ struct ChunkTree(Vec<ChunkNode>);
 
 impl ChunkTree {
     const CHUNK_NODE_DEPTH: u32 = Lod::MAX.0 as u32;
+    const ENCODER_VERSION: u32 = 1;
 
     /// Compresses this chunk data into a very dense form.
     /// This is mainly used for serialization, but is generally useful for compressing data as needed.
-    pub fn compress<O>(&self) -> Vec<u8> {
-        todo!()
+    pub fn compress(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        // Parent nodes only need 4 bytes.
+        // Leaf nodes take 5 bytes (4 for voxel data, 1 for exactness).
+        // Parent nodes take 4 bytes (for child index).
+        // Most nodes will probably be leaves.
+        // Plus four for version.
+        // Plus four for length.
+        // This will over allocate, but better than allocating twice.
+        data.reserve_exact(self.0.len() * 5 + 8);
+        data.extend_from_slice(&Self::ENCODER_VERSION.to_be_bytes());
+        data.extend_from_slice(&(self.0.len() as u32).to_be_bytes());
+
+        fn compress_node(node: ChunkNode, data: &mut Vec<u8>) {
+            match node.children() {
+                Some(children) => {
+                    // Turn on reserved bit to mark it as a parent.
+                    let bits = children.get() | VoxelData::RESERVED_BIT;
+                    data.extend_from_slice(&bits.to_be_bytes());
+                }
+                None => {
+                    data.extend_from_slice(&node.voxel_data.to_bits().to_be_bytes());
+                    data.push(node.exact_to().0);
+                }
+            }
+        }
+
+        // SAFETY: 0 is always valid
+        let root = unsafe { *self.0.get_unchecked(0) };
+        compress_node(root, &mut data);
+
+        // SAFETY: 0 is always valid, and this will only be used on self.
+        let mut iter = unsafe { ChunkNodeIterator::start_at(0) };
+        while let Some(index) = iter.progress_next_node_depth_first(self) {
+            // SAFETY: `ChunkNodeIterator` indices are always valid.
+            let node = unsafe { *self.0.get_unchecked(index.get() as usize) };
+            compress_node(node, &mut data);
+        }
+
+        data
     }
 
     /// Expands chunk data from a very dense form.
@@ -198,6 +237,7 @@ impl ChunkNodeIterator {
     }
 
     /// Finds the next node in a depth first search.
+    /// This is guaranteed to return a valid index in the tree.
     fn progress_next_node_depth_first(&mut self, tree: &ChunkTree) -> Option<NonZero<u32>> {
         let c = *self.0.last()?;
         // SAFETY: These indices are valid.
