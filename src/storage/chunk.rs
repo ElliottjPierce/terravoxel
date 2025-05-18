@@ -1,7 +1,8 @@
 //! Contains the logic for specifying bulk [`VoxelData`].
 
-use core::{num::NonZero, u32};
+use core::num::NonZero;
 
+use arrayvec::ArrayVec;
 use bevy_math::IVec3;
 use bevy_platform::prelude::*;
 
@@ -158,6 +159,86 @@ impl ChunkTree {
     /// This is mainly used for deserialization, but is generally useful for restoring [`Self::compress`]ed data as needed.
     pub fn expand(compressed: &[u8]) -> Self {
         todo!()
+    }
+}
+
+/// Stores a path down the tree and a way to traverse it.
+///
+/// Each item in the list is a `u32` that represents the index of its node and the spatial index (0..8) of its child, which is or will be in the following list item.
+/// The node's index in the list is in the least significant 25 bits, and the spatial index of the child following it (0..8) is in the most significant 3 bits.
+///
+/// # Safety
+///
+/// This array must never be empty.
+/// This array may only be interacted with through the type's methods.
+#[derive(PartialEq, Eq, Clone)]
+struct ChunkNodeIterator(ArrayVec<u32, { ChunkTree::CHUNK_NODE_DEPTH as usize + 1 }>);
+
+impl ChunkNodeIterator {
+    const NODE_INDEX_BITS: u32 = ChunkNode::CHILDREN_INDEX_BITS;
+    const SPATIAL_INDEX_SHIFT: u32 = 29;
+
+    /// Creates a [`ChunkNodeIterator`] starting at this node `index`.
+    /// Note that the `index` is never returned in iteration.
+    ///
+    /// The index must be less than the max; no high bits may be on.
+    /// Doing otherwise is not a safety issues, but would be a nasty logic error.
+    ///
+    /// # Safety
+    ///
+    /// The `index` must be a valid index in the [`ChunkTree`] it will be used in.
+    /// This must only ever be used for that same tree.
+    unsafe fn start_at(index: u32) -> Self {
+        let mut vec = ArrayVec::new_const();
+        // SAFETY: CAP > 1
+        unsafe {
+            vec.push_unchecked(index);
+        }
+        Self(vec)
+    }
+
+    /// Finds the next node in a depth first search.
+    fn progress_next_node_depth_first(&mut self, tree: &ChunkTree) -> Option<NonZero<u32>> {
+        let c = *self.0.last()?;
+        // SAFETY: These indices are valid.
+        let node = unsafe { *tree.0.get_unchecked((c & Self::NODE_INDEX_BITS) as usize) };
+
+        match node.children() {
+            // If we can go down, do.
+            Some(children) => {
+                // SAFETY: The capacity is the maximum depth of the node.
+                unsafe {
+                    self.0.push_unchecked(children.get());
+                }
+                Some(children)
+            }
+            // If we can't go down, we need to go up, until we can go down again.
+            None => loop {
+                // pop this fully explored node
+                // SAFETY: We just got a last item `c`.
+                _ = unsafe { self.0.pop().unwrap_unchecked() };
+
+                let c = self.0.last_mut()?;
+                if let Some(next) = c.checked_add(1 << Self::SPATIAL_INDEX_SHIFT) {
+                    // We have another child to explore
+                    *c = next;
+                    let node_index = next & Self::NODE_INDEX_BITS;
+                    // SAFETY: These indices are valid.
+                    let node = unsafe { *tree.0.get_unchecked(node_index as usize) };
+
+                    // SAFETY: We just popped a child of `node`, so `node` has children.
+                    let index = unsafe { node.children().unwrap_unchecked().get() }
+                        + (next >> Self::SPATIAL_INDEX_SHIFT);
+                    // Push on the new node to explore its children.
+                    self.0.push(index);
+                    // SAFETY: The only time we add an element to the array is either when it is a child (which is non-zero) or in index 0 from `start_at(0)`.
+                    // And we never return the first item; when all has been explored, we pop the only element in the list, and then return upon a `None` last.
+                    // If this `if let Some` branch is taken, clearly index is not 0 since it came from a nonzero.
+                    break Some(unsafe { NonZero::new_unchecked(index) });
+                }
+                // Else: We have finished exploring the node and its children, loop and pop the explored node.
+            },
+        }
     }
 }
 
