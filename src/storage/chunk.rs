@@ -144,7 +144,10 @@ impl ChunkNode {
 /// # Safety
 ///
 /// This must always have the root node at index 0.
-struct ChunkTree(Vec<ChunkNode>);
+struct ChunkTree {
+    tree: Vec<ChunkNode>,
+    index_to_free: Option<NonZero<u32>>,
+}
 
 impl ChunkTree {
     const CHUNK_NODE_DEPTH: u32 = Lod::MAX.0 as u32;
@@ -161,9 +164,9 @@ impl ChunkTree {
         // Plus four for version.
         // Plus four for length.
         // This will over allocate, but better than allocating twice.
-        data.reserve_exact(self.0.len() * 5 + 8);
+        data.reserve_exact(self.tree.len() * 5 + 8);
         data.extend_from_slice(&Self::ENCODER_VERSION.to_be_bytes());
-        data.extend_from_slice(&(self.0.len() as u32).to_be_bytes());
+        data.extend_from_slice(&(self.tree.len() as u32).to_be_bytes());
 
         fn compress_node(node: ChunkNode, data: &mut Vec<u8>) {
             match node.children() {
@@ -180,14 +183,14 @@ impl ChunkTree {
         }
 
         // SAFETY: 0 is always valid
-        let root = unsafe { *self.0.get_unchecked(0) };
+        let root = unsafe { *self.tree.get_unchecked(0) };
         compress_node(root, &mut data);
 
         // SAFETY: 0 is always valid, and this will only be used on self.
         let mut iter = unsafe { ChunkNodeIterator::start_at(0) };
         while let Some(index) = iter.progress_next_node_depth_first(self) {
             // SAFETY: `ChunkNodeIterator` indices are always valid.
-            let node = unsafe { *self.0.get_unchecked(index.get() as usize) };
+            let node = unsafe { *self.tree.get_unchecked(index.get() as usize) };
             compress_node(node, &mut data);
         }
 
@@ -241,7 +244,11 @@ impl ChunkNodeIterator {
     fn progress_next_node_depth_first(&mut self, tree: &ChunkTree) -> Option<NonZero<u32>> {
         let c = *self.0.last()?;
         // SAFETY: These indices are valid.
-        let node = unsafe { *tree.0.get_unchecked((c & Self::NODE_INDEX_BITS) as usize) };
+        let node = unsafe {
+            *tree
+                .tree
+                .get_unchecked((c & Self::NODE_INDEX_BITS) as usize)
+        };
 
         match node.children() {
             // If we can go down, do.
@@ -264,7 +271,7 @@ impl ChunkNodeIterator {
                     *c = next;
                     let node_index = next & Self::NODE_INDEX_BITS;
                     // SAFETY: These indices are valid.
-                    let node = unsafe { *tree.0.get_unchecked(node_index as usize) };
+                    let node = unsafe { *tree.tree.get_unchecked(node_index as usize) };
 
                     // SAFETY: We just popped a child of `node`, so `node` has children.
                     let index = unsafe { node.children().unwrap_unchecked().get() }
