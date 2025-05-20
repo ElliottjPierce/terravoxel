@@ -12,6 +12,7 @@ use crate::storage::voxel::VoxelData;
 /// This value must be in range 0..=[`Lod::MAX`], 0 meaning an exact voxel, max meaning an entire chunk.
 /// A [`Lod`] that is greater than another represents a bigger area and will be less detailed/precise.
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+#[repr(transparent)]
 pub struct Lod(u8);
 
 impl Lod {
@@ -23,6 +24,19 @@ impl Lod {
     /// The length of the cube that this lod would cover.
     pub const fn length(self) -> u32 {
         1u32 << self.0 as u32
+    }
+
+    const fn try_from_index(index: u8) -> Option<Self> {
+        if index <= Self::MAX.0 {
+            Some(Self(index))
+        } else {
+            None
+        }
+    }
+
+    /// The index of the lod; its inner representation.
+    pub const fn index(self) -> u8 {
+        self.0
     }
 }
 
@@ -144,14 +158,40 @@ impl ChunkNode {
 /// # Safety
 ///
 /// This must always have the root node at index 0.
-struct ChunkTree {
+pub struct ChunkTree {
     tree: Vec<ChunkNode>,
     index_to_free: Option<NonZero<u32>>,
+}
+
+/// An error that can occur when expanding a chunk tree.
+pub enum ChunkExpansionError {
+    /// The version number does not correspond to any version ever.
+    InvalidVersion(u32),
+    /// The stamped length of the tree was wrong.
+    IncorrectTreeLen {
+        /// The tree length from the tree transversal.
+        data: u32,
+        /// The tree length from the compressed stamp.
+        stamp: u32,
+    },
+    /// Th stamped length was impossible (0 or really big)
+    ImpossibleTreeLen(u32),
+    /// The compressed buffer was smaller than expected.
+    UnexpectedBufferEnd,
+    /// The buffer did not end when the tree was finished being expanded.
+    UnexpectedBufferExcess,
+    /// A child index of the tree was invalid.
+    InvalidIndex(u32),
+    /// The [`Lod`] for exactness was invalid.
+    InvalidExactness(u8),
+    /// The data spelled out by the tree was deeper than is allowed.
+    TreeDepthExceeded,
 }
 
 impl ChunkTree {
     const CHUNK_NODE_DEPTH: u32 = Lod::MAX.0 as u32;
     const ENCODER_VERSION: u32 = 1;
+    const MAX_NODES: u32 = 19173961;
 
     /// Compresses this chunk data into a very dense form.
     /// This is mainly used for serialization, but is generally useful for compressing data as needed.
@@ -177,7 +217,7 @@ impl ChunkTree {
                 }
                 None => {
                     data.extend_from_slice(&node.voxel_data.to_bits().to_be_bytes());
-                    data.push(node.exact_to().0);
+                    data.push(node.exact_to().index());
                 }
             }
         }
@@ -199,8 +239,143 @@ impl ChunkTree {
 
     /// Expands chunk data from a very dense form.
     /// This is mainly used for deserialization, but is generally useful for restoring [`Self::compress`]ed data as needed.
-    pub fn expand(compressed: &[u8]) -> Self {
-        todo!()
+    pub fn expand(compressed: &[u8]) -> Result<Self, ChunkExpansionError> {
+        fn next_u32(buff: &mut impl Iterator<Item = u8>) -> Result<u32, ChunkExpansionError> {
+            Ok(u32::from_be_bytes([
+                buff.next()
+                    .ok_or(ChunkExpansionError::UnexpectedBufferEnd)?,
+                buff.next()
+                    .ok_or(ChunkExpansionError::UnexpectedBufferEnd)?,
+                buff.next()
+                    .ok_or(ChunkExpansionError::UnexpectedBufferEnd)?,
+                buff.next()
+                    .ok_or(ChunkExpansionError::UnexpectedBufferEnd)?,
+            ]))
+        }
+
+        let mut buff = compressed.iter().copied();
+        let version = next_u32(&mut buff)?;
+        if version != Self::ENCODER_VERSION {
+            return Err(ChunkExpansionError::InvalidVersion(version));
+        }
+        let len = next_u32(&mut buff)?;
+        if len == 0 {
+            return Err(ChunkExpansionError::ImpossibleTreeLen(len));
+        }
+        if len > Self::MAX_NODES {
+            return Err(ChunkExpansionError::ImpossibleTreeLen(len));
+        }
+
+        let first = next_u32(&mut buff)?;
+        // It's data
+        if first & VoxelData::RESERVED_BIT == 0 {
+            let mut tree = Vec::new();
+            let exactness = buff
+                .next()
+                .ok_or(ChunkExpansionError::UnexpectedBufferEnd)?;
+            let mut root = ChunkNode::PLACEHOLDER;
+            root.set_exact_to(
+                Lod::try_from_index(exactness)
+                    .ok_or(ChunkExpansionError::InvalidExactness(exactness))?,
+            );
+            root.voxel_data = VoxelData::from_bits_unchecked(first); // Reserved bit was off.
+            tree.push(root);
+
+            if buff.next().is_some() {
+                return Err(ChunkExpansionError::IncorrectTreeLen {
+                    data: compressed.len() as u32 - 13,
+                    stamp: len,
+                });
+            }
+
+            Ok(Self {
+                tree,
+                index_to_free: None,
+            })
+        }
+        // It's a parent
+        else {
+            let mut tree = Vec::with_capacity(len as usize);
+            tree.resize(len as usize, ChunkNode::PLACEHOLDER);
+
+            // This follows the same format as `ChunkNodeIterator`, but we're building the tree as we iterate it.
+            // SAFETY: We must only ever push valid indexes here. (We checked earlier that the len > 0.)
+            let mut path =
+                ArrayVec::<u32, { ChunkTree::CHUNK_NODE_DEPTH as usize + 1 }>::new_const();
+            // SAFETY: Cap > 0.
+            unsafe {
+                path.push_unchecked(0);
+            }
+
+            'decode: loop {
+                // SAFETY: We start the path with 1 element. There is only one place we pop,
+                // and it is immediately followed by checking if it's now empty.
+                let path_item = unsafe { path.last_mut().unwrap_unchecked() };
+                let bulk = next_u32(&mut buff)?;
+                let node_index = (*path_item & ChunkNodeIterator::NODE_INDEX_BITS)
+                    + (*path_item >> ChunkNodeIterator::SPATIAL_INDEX_SHIFT);
+
+                // It's data
+                if bulk & VoxelData::RESERVED_BIT == 0 {
+                    // SAFETY: path indices are correct.
+                    let node = unsafe { tree.get_unchecked_mut(node_index as usize) };
+                    let exactness = buff
+                        .next()
+                        .ok_or(ChunkExpansionError::UnexpectedBufferEnd)?;
+                    node.set_exact_to(
+                        Lod::try_from_index(exactness)
+                            .ok_or(ChunkExpansionError::InvalidExactness(exactness))?,
+                    );
+                    node.voxel_data = VoxelData::from_bits_unchecked(first); // Reserved bit was off.
+
+                    // Now we need to find the next branch to explore
+                    'walk_up: loop {
+                        // pop this fully explored node
+                        // SAFETY: We just got this last node.
+                        _ = unsafe { path.pop().unwrap_unchecked() };
+
+                        let Some(c) = path.last_mut() else {
+                            // We have gone through the whole tree.
+                            break 'decode;
+                        };
+                        if let Some(next) =
+                            c.checked_add(1 << ChunkNodeIterator::SPATIAL_INDEX_SHIFT)
+                        {
+                            // We have another child to explore
+                            *c = next;
+                            break 'walk_up;
+                        }
+                        // Else: We have finished exploring the node and its children, loop and pop the explored node.
+                    }
+                }
+                // It's a parent
+                else {
+                    let fist_child_idx = bulk & !VoxelData::RESERVED_BIT;
+                    let last_child_idx = fist_child_idx.saturating_add(7);
+                    if last_child_idx >= len {
+                        return Err(ChunkExpansionError::InvalidIndex(fist_child_idx));
+                    }
+
+                    // SAFETY: We just verified it is in bounds.
+                    path.try_push(fist_child_idx)
+                        .ok()
+                        .ok_or(ChunkExpansionError::TreeDepthExceeded)?;
+                }
+            }
+
+            let mut free_idx = 0u32;
+            for (idx, item) in tree.iter_mut().enumerate() {
+                if *item == ChunkNode::PLACEHOLDER {
+                    item.meta = free_idx;
+                    free_idx = idx as u32;
+                }
+            }
+
+            Ok(Self {
+                tree,
+                index_to_free: NonZero::new(free_idx),
+            })
+        }
     }
 }
 
@@ -309,5 +484,6 @@ mod tests {
         let total_possible_nodes: u32 = (0..=Lod::MAX.0).map(|l| 8u32.pow(l as u32)).sum();
         // The child index must only ever take 25 bits.
         assert!(total_possible_nodes < 2u32.pow(25));
+        assert_eq!(total_possible_nodes, ChunkTree::MAX_NODES);
     }
 }
