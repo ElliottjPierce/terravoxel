@@ -57,7 +57,7 @@ impl Lod {
 /// - The index of the first of the 8 children, which will be stored next to each other.
 ///
 /// This can also represent a "free" node, which is void and pending reuse.
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 struct ChunkNode {
     /// The voxel data for this cube.
     voxel_data: VoxelData,
@@ -159,7 +159,7 @@ impl ChunkNode {
 /// # Safety
 ///
 /// This must always have the root node at index 0.
-#[derive(PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ChunkTree {
     tree: Vec<ChunkNode>,
     index_to_free: Option<NonZero<u32>>,
@@ -278,6 +278,7 @@ impl ChunkTree {
                 .next()
                 .ok_or(ChunkExpansionError::UnexpectedBufferEnd)?;
             let mut root = ChunkNode::PLACEHOLDER;
+            root.meta = 0;
             root.set_exact_to(
                 Lod::try_from_index(exactness)
                     .ok_or(ChunkExpansionError::InvalidExactness(exactness))?,
@@ -299,27 +300,40 @@ impl ChunkTree {
             let mut tree = Vec::with_capacity(len as usize);
             tree.resize(len as usize, ChunkNode::PLACEHOLDER);
 
+            let first_child_idx = first & !VoxelData::RESERVED_BIT;
+            let last_child_idx = first_child_idx.saturating_add(7);
+            if last_child_idx >= len || first_child_idx == 0 || first_child_idx & 0b111 != 1 {
+                return Err(ChunkExpansionError::InvalidIndex(first_child_idx));
+            }
+
+            // SAFETY: We checked for len == 0 earlier.
+            let root = unsafe { tree.get_unchecked_mut(0) };
+            root.meta = first_child_idx;
+
             // This follows the same format as `ChunkNodeIterator`, but we're building the tree as we iterate it.
             // SAFETY: We must only ever push valid indexes here. (We checked earlier that the len > 0.)
             let mut path =
                 ArrayVec::<u32, { ChunkTree::CHUNK_NODE_DEPTH as usize + 1 }>::new_const();
-            // SAFETY: Cap > 0.
+            // SAFETY: Cap > 2.
             unsafe {
-                path.push_unchecked(0);
+                // Each item points to the next.
+                // At any given point, the last item is the next to pull from the buffer and the one before it should point to it.
+                path.push_unchecked(first_child_idx);
+                path.push_unchecked(first_child_idx);
             }
 
             'decode: loop {
                 // SAFETY: We start the path with 1 element. There is only one place we pop,
                 // and it is immediately followed by checking if it's now empty.
                 let path_item = unsafe { path.last_mut().unwrap_unchecked() };
+                let node_index = *path_item & ChunkNodeIterator::NODE_INDEX_BITS;
                 let bulk = next_u32(&mut buff)?;
-                let node_index = (*path_item & ChunkNodeIterator::NODE_INDEX_BITS)
-                    + (*path_item >> ChunkNodeIterator::SPATIAL_INDEX_SHIFT);
 
                 // It's data
                 if bulk & VoxelData::RESERVED_BIT == 0 {
                     // SAFETY: path indices are correct.
                     let node = unsafe { tree.get_unchecked_mut(node_index as usize) };
+                    node.meta = 0;
                     let exactness = buff
                         .next()
                         .ok_or(ChunkExpansionError::UnexpectedBufferEnd)?;
@@ -327,7 +341,7 @@ impl ChunkTree {
                         Lod::try_from_index(exactness)
                             .ok_or(ChunkExpansionError::InvalidExactness(exactness))?,
                     );
-                    node.voxel_data = VoxelData::from_bits_unchecked(first); // Reserved bit was off.
+                    node.voxel_data = VoxelData::from_bits_unchecked(bulk); // Reserved bit was off.
 
                     // Now we need to find the next branch to explore
                     'walk_up: loop {
@@ -344,6 +358,14 @@ impl ChunkTree {
                         {
                             // We have another child to explore
                             *c = next;
+                            // SAFETY: We just popped, so capacity is ok.
+                            unsafe {
+                                path.push_unchecked(
+                                    (next & ChunkNodeIterator::NODE_INDEX_BITS)
+                                        + (next >> ChunkNodeIterator::SPATIAL_INDEX_SHIFT),
+                                );
+                            }
+
                             break 'walk_up;
                         }
                         // Else: We have finished exploring the node and its children, loop and pop the explored node.
@@ -351,17 +373,19 @@ impl ChunkTree {
                 }
                 // It's a parent
                 else {
-                    let fist_child_idx = bulk & !VoxelData::RESERVED_BIT;
-                    let last_child_idx = fist_child_idx.saturating_add(7);
-                    if last_child_idx >= len
-                        || fist_child_idx <= 1
-                        || (fist_child_idx - 1) & 0b111 > 0
+                    let first_child_idx = bulk & !VoxelData::RESERVED_BIT;
+                    let last_child_idx = first_child_idx.saturating_add(7);
+                    if last_child_idx >= len || first_child_idx == 0 || first_child_idx & 0b111 != 1
                     {
-                        return Err(ChunkExpansionError::InvalidIndex(fist_child_idx));
+                        return Err(ChunkExpansionError::InvalidIndex(first_child_idx));
                     }
 
+                    // SAFETY: path indices are correct.
+                    let node = unsafe { tree.get_unchecked_mut(node_index as usize) };
+                    node.meta = first_child_idx;
+
                     // SAFETY: We just verified it is in bounds.
-                    path.try_push(fist_child_idx)
+                    path.try_push(first_child_idx)
                         .ok()
                         .ok_or(ChunkExpansionError::TreeDepthExceeded)?;
                 }
@@ -485,6 +509,8 @@ impl Chunk {
 
 #[cfg(test)]
 mod tests {
+    use crate::storage::voxel::{VoxelFullness, VoxelLayer, VoxelMaterial};
+
     use super::*;
 
     #[test]
@@ -498,52 +524,95 @@ mod tests {
     #[test]
     fn tree_round_trip() {
         let tree = ChunkTree {
+            tree: vec![ChunkNode {
+                voxel_data: VoxelData::PLACEHOLDER,
+                meta: 0,
+            }],
+            index_to_free: None,
+        };
+        let compressed = tree.compress();
+        let expanded = ChunkTree::expand(&compressed).unwrap();
+        assert_eq!(tree, expanded);
+
+        let layer = VoxelLayer::from_u32(1).unwrap();
+        let fullness = VoxelFullness::from_quantized(122);
+        let tree = ChunkTree {
             tree: vec![
                 ChunkNode {
                     voxel_data: VoxelData::PLACEHOLDER,
                     meta: 1,
                 },
                 ChunkNode {
-                    voxel_data: VoxelData::PLACEHOLDER,
+                    voxel_data: VoxelData::new(
+                        layer,
+                        VoxelMaterial::from_u32(1).unwrap(),
+                        fullness,
+                    ),
                     meta: 0,
                 },
                 ChunkNode {
-                    voxel_data: VoxelData::PLACEHOLDER,
+                    voxel_data: VoxelData::new(
+                        layer,
+                        VoxelMaterial::from_u32(2).unwrap(),
+                        fullness,
+                    ),
                     meta: 0,
                 },
                 ChunkNode {
-                    voxel_data: VoxelData::PLACEHOLDER,
+                    voxel_data: VoxelData::new(
+                        layer,
+                        VoxelMaterial::from_u32(3).unwrap(),
+                        fullness,
+                    ),
                     meta: 0,
                 },
                 ChunkNode {
-                    voxel_data: VoxelData::PLACEHOLDER,
+                    voxel_data: VoxelData::new(
+                        layer,
+                        VoxelMaterial::from_u32(4).unwrap(),
+                        fullness,
+                    ),
                     meta: 0,
                 },
                 ChunkNode {
-                    voxel_data: VoxelData::PLACEHOLDER,
+                    voxel_data: VoxelData::new(
+                        layer,
+                        VoxelMaterial::from_u32(5).unwrap(),
+                        fullness,
+                    ),
                     meta: 0,
                 },
                 ChunkNode {
-                    voxel_data: VoxelData::PLACEHOLDER,
+                    voxel_data: VoxelData::new(
+                        layer,
+                        VoxelMaterial::from_u32(6).unwrap(),
+                        fullness,
+                    ),
                     meta: 0,
                 },
                 ChunkNode {
-                    voxel_data: VoxelData::PLACEHOLDER,
+                    voxel_data: VoxelData::new(
+                        layer,
+                        VoxelMaterial::from_u32(7).unwrap(),
+                        fullness,
+                    ),
                     meta: 0,
                 },
                 ChunkNode {
-                    voxel_data: VoxelData::PLACEHOLDER,
-                    meta: 0,
-                },
-                ChunkNode {
-                    voxel_data: VoxelData::PLACEHOLDER,
+                    voxel_data: VoxelData::new(
+                        layer,
+                        VoxelMaterial::from_u32(8).unwrap(),
+                        fullness,
+                    ),
                     meta: 0,
                 },
             ],
             index_to_free: None,
         };
         let compressed = tree.compress();
+        assert_eq!(compressed.len(), 52);
         let expanded = ChunkTree::expand(&compressed).unwrap();
-        assert!(tree == expanded);
+        assert_eq!(tree.tree, expanded.tree);
+        assert_eq!(tree, expanded);
     }
 }

@@ -124,6 +124,12 @@ impl VoxelFullness {
     pub const fn fullness_quantized(self) -> u8 {
         self.0
     }
+
+    /// Creates the [`VoxelFullness`] from its [quantized](Self::fullness_quantized) value.
+    #[inline]
+    pub const fn from_quantized(fullness: u8) -> Self {
+        Self(fullness)
+    }
 }
 
 impl Debug for VoxelFullness {
@@ -327,10 +333,11 @@ impl Debug for VoxelData {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
-            "VoxelData {{ layer: {0:?}, material: {1:?}, fullness: {2:?}, }}",
+            "VoxelData {{ layer: {0:?}, material: {1:?}, fullness: {2:?}, }} (bits: {3})",
             self.layer(),
             self.material(),
-            self.fullness()
+            self.fullness(),
+            self.0
         )
     }
 }
