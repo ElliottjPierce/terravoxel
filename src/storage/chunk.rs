@@ -5,6 +5,7 @@ use core::num::NonZero;
 use arrayvec::ArrayVec;
 use bevy_math::IVec3;
 use bevy_platform::prelude::*;
+use thiserror::Error;
 
 use crate::storage::voxel::VoxelData;
 
@@ -158,33 +159,36 @@ impl ChunkNode {
 /// # Safety
 ///
 /// This must always have the root node at index 0.
+#[derive(PartialEq, Eq, Clone)]
 pub struct ChunkTree {
     tree: Vec<ChunkNode>,
     index_to_free: Option<NonZero<u32>>,
 }
 
 /// An error that can occur when expanding a chunk tree.
+#[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum ChunkExpansionError {
     /// The version number does not correspond to any version ever.
+    #[error("The version is not recognized.")]
     InvalidVersion(u32),
-    /// The stamped length of the tree was wrong.
-    IncorrectTreeLen {
-        /// The tree length from the tree transversal.
-        data: u32,
-        /// The tree length from the compressed stamp.
-        stamp: u32,
-    },
     /// Th stamped length was impossible (0 or really big)
+    #[error("The tree's length stamp is impossible: {0}.")]
     ImpossibleTreeLen(u32),
     /// The compressed buffer was smaller than expected.
+    #[error("The compressed buffer ended before a valid tree structure could be found.")]
     UnexpectedBufferEnd,
     /// The buffer did not end when the tree was finished being expanded.
+    #[error("data store disconnected")]
     UnexpectedBufferExcess,
     /// A child index of the tree was invalid.
+    #[error("A parent's node's child index is wrong:")]
     InvalidIndex(u32),
     /// The [`Lod`] for exactness was invalid.
+    #[error("A leaf node's exactness was invalid.")]
     InvalidExactness(u8),
     /// The data spelled out by the tree was deeper than is allowed.
+    #[error("The tree seems to be deeper than a chunk can be.")]
     TreeDepthExceeded,
 }
 
@@ -282,10 +286,7 @@ impl ChunkTree {
             tree.push(root);
 
             if buff.next().is_some() {
-                return Err(ChunkExpansionError::IncorrectTreeLen {
-                    data: compressed.len() as u32 - 13,
-                    stamp: len,
-                });
+                return Err(ChunkExpansionError::UnexpectedBufferExcess);
             }
 
             Ok(Self {
@@ -352,7 +353,10 @@ impl ChunkTree {
                 else {
                     let fist_child_idx = bulk & !VoxelData::RESERVED_BIT;
                     let last_child_idx = fist_child_idx.saturating_add(7);
-                    if last_child_idx >= len {
+                    if last_child_idx >= len
+                        || fist_child_idx <= 1
+                        || (fist_child_idx - 1) & 0b111 > 0
+                    {
                         return Err(ChunkExpansionError::InvalidIndex(fist_child_idx));
                     }
 
@@ -361,6 +365,10 @@ impl ChunkTree {
                         .ok()
                         .ok_or(ChunkExpansionError::TreeDepthExceeded)?;
                 }
+            }
+
+            if buff.next().is_some() {
+                return Err(ChunkExpansionError::UnexpectedBufferExcess);
             }
 
             let mut free_idx = 0u32;
@@ -485,5 +493,57 @@ mod tests {
         // The child index must only ever take 25 bits.
         assert!(total_possible_nodes < 2u32.pow(25));
         assert_eq!(total_possible_nodes, ChunkTree::MAX_NODES);
+    }
+
+    #[test]
+    fn tree_round_trip() {
+        let tree = ChunkTree {
+            tree: vec![
+                ChunkNode {
+                    voxel_data: VoxelData::PLACEHOLDER,
+                    meta: 1,
+                },
+                ChunkNode {
+                    voxel_data: VoxelData::PLACEHOLDER,
+                    meta: 0,
+                },
+                ChunkNode {
+                    voxel_data: VoxelData::PLACEHOLDER,
+                    meta: 0,
+                },
+                ChunkNode {
+                    voxel_data: VoxelData::PLACEHOLDER,
+                    meta: 0,
+                },
+                ChunkNode {
+                    voxel_data: VoxelData::PLACEHOLDER,
+                    meta: 0,
+                },
+                ChunkNode {
+                    voxel_data: VoxelData::PLACEHOLDER,
+                    meta: 0,
+                },
+                ChunkNode {
+                    voxel_data: VoxelData::PLACEHOLDER,
+                    meta: 0,
+                },
+                ChunkNode {
+                    voxel_data: VoxelData::PLACEHOLDER,
+                    meta: 0,
+                },
+                ChunkNode {
+                    voxel_data: VoxelData::PLACEHOLDER,
+                    meta: 0,
+                },
+                ChunkNode {
+                    voxel_data: VoxelData::PLACEHOLDER,
+                    meta: 0,
+                },
+            ],
+            index_to_free: None,
+        };
+        let compressed = tree.compress();
+        let expanded = ChunkTree::expand(&compressed).unwrap();
+        assert!(tree == expanded);
     }
 }
