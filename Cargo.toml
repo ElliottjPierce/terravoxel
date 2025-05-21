@@ -11,6 +11,7 @@ bevy_pbr = { version = "0.16", default-features = false }
 bevy_platform = { version = "0.16", default-features = false, features = ["std"] }
 arrayvec = {version = "0.7.6", default-features = false }
 thiserror = "2.0.12"
+fixedbitset = "0.5.7"
 
 [dev-dependencies]
 # for examples

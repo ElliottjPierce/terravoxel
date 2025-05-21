@@ -3,8 +3,9 @@
 use core::num::NonZero;
 
 use arrayvec::ArrayVec;
-use bevy_math::UVec3;
+use bevy_math::{U8Vec3, UVec3};
 use bevy_platform::{prelude::*, sync::Arc};
+use fixedbitset::FixedBitSet;
 use thiserror::Error;
 
 use crate::storage::voxel::VoxelData;
@@ -14,7 +15,7 @@ use super::voxel::VoxelLocation;
 /// Represents a level of detail or layer of octree.
 /// This value must be in range 0..=[`Lod::MAX`], 0 meaning an exact voxel, max meaning an entire chunk.
 /// A [`Lod`] that is greater than another represents a bigger area and will be less detailed/precise.
-#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 #[repr(transparent)]
 pub struct Lod(u8);
 
@@ -58,10 +59,14 @@ impl Lod {
 /// - Whether or not that [`VoxelData`] approximation is up to date (It's a useful cache, but we only update it as needed),
 /// - The index of the first of the 8 children, which will be stored next to each other.
 ///
+/// If it is free (available for reuse):
+///
+/// - The index (or 0) of another 8 free nodes.
+///
 /// This can also represent a "free" node, which is void and pending reuse.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 struct ChunkNode {
-    /// The voxel data for this cube.
+    /// The voxel data for this cube. (Unless it is free)
     voxel_data: VoxelData,
     /// This contains most other metadata about the node.
     /// The least significant 25 bits store the index to the child nodes.
@@ -75,10 +80,9 @@ struct ChunkNode {
     ///
     /// If it is a parent node:
     ///
-    /// - 1 bit for if the [`VoxelData`] has been dirtied or not (If it has, we will need to redo [`VoxelData::approximate`]),
-    /// - 6 bits currently unused,
+    /// - 7 bits currently unused,
     ///
-    /// If this is nod a node and is "free", this just stores the index to the next free node, or 0 if there is no free node.
+    /// If this is not a node and is "free", this just stores the index to the next free node, or 0 if there is no free node.
     ///
     /// # Safety
     ///
@@ -124,35 +128,10 @@ impl ChunkNode {
         Lod((self.meta >> Self::EXACTNESS_SHIFT) as u8)
     }
 
-    /// Sets [`Self::exact_to`].
-    /// This should only be done if this is a leaf node.
+    /// Sets [`Self::exact_to`], making this a leaf node.
     #[inline]
     fn set_exact_to(&mut self, value: Lod) {
-        self.meta =
-            (self.meta & !Self::EXACTNESS_BITS) | ((value.0 as u32) << Self::EXACTNESS_SHIFT);
-    }
-
-    /// If this is a parent node, returns if the current voxel data still correctly approximates its children.
-    /// If not, this should be recalculated with [`VoxelData::approximate`].
-    ///
-    /// If this is not a parent node, this result is meaningless.
-    /// It is still safe, but using it as correct is a logic error.
-    #[inline]
-    fn is_dirty(self) -> bool {
-        self.meta & Self::DIRTY_BIT > 0
-    }
-    /// Sets [`Self::is_dirty`] to true.
-    /// This should only be done if this is a parent node.
-    #[inline]
-    fn set_dirty_true(&mut self) {
-        self.meta |= Self::DIRTY_BIT;
-    }
-
-    /// Sets [`Self::is_dirty`] to false.
-    /// This should only be done if this is a parent node.
-    #[inline]
-    fn set_dirty_false(&mut self) {
-        self.meta &= !Self::DIRTY_BIT;
+        self.meta = (value.0 as u32) << Self::EXACTNESS_SHIFT;
     }
 }
 
@@ -164,6 +143,7 @@ impl ChunkNode {
 #[derive(Debug, PartialEq, Eq, Clone)]
 struct ChunkTree {
     tree: Vec<ChunkNode>,
+    /// Points to a region of 8 free nodes, or `None` if none are free.
     index_to_free: Option<NonZero<u32>>,
 }
 
@@ -265,10 +245,7 @@ impl ChunkTree {
             return Err(ChunkExpansionError::InvalidVersion(version));
         }
         let len = next_u32(&mut buff)?;
-        if len == 0 {
-            return Err(ChunkExpansionError::ImpossibleTreeLen(len));
-        }
-        if len > Self::MAX_NODES {
+        if len == 0 || len > Self::MAX_NODES || len & 0b111 != 1 {
             return Err(ChunkExpansionError::ImpossibleTreeLen(len));
         }
 
@@ -280,7 +257,6 @@ impl ChunkTree {
                 .next()
                 .ok_or(ChunkExpansionError::UnexpectedBufferEnd)?;
             let mut root = ChunkNode::PLACEHOLDER;
-            root.meta = 0;
             root.set_exact_to(
                 Lod::try_from_index(exactness)
                     .ok_or(ChunkExpansionError::InvalidExactness(exactness))?,
@@ -398,10 +374,13 @@ impl ChunkTree {
             }
 
             let mut free_idx = 0u32;
-            for (idx, item) in tree.iter_mut().enumerate() {
-                if *item == ChunkNode::PLACEHOLDER {
-                    item.meta = free_idx;
-                    free_idx = idx as u32;
+            for iter_idx in 0..(len >> 3) {
+                let idx = (iter_idx << 3) + 1;
+                // SAFETY: `len` is the length of the `tree`, it ends in 0b001, and the shifts cancel each other out.
+                let node = unsafe { tree.get_unchecked_mut(idx as usize) };
+                if *node == ChunkNode::PLACEHOLDER {
+                    node.meta = free_idx;
+                    free_idx = idx;
                 }
             }
 
@@ -410,6 +389,94 @@ impl ChunkTree {
                 index_to_free: NonZero::new(free_idx),
             })
         }
+    }
+
+    /// Applies all changes in these changes, creating new nodes as needed.
+    fn apply_changes(&mut self, changes: &mut ChunkChanges) {
+        for (loc, data) in changes.0.drain(..) {
+            let node_index = self.find_or_make_node_index(loc);
+            // SAFETY: This index is correct.
+            let node = unsafe { self.tree.get_unchecked_mut(node_index as usize) };
+            node.voxel_data = data;
+            // TODO: What if this node is a parent? Silently ignore, Delete children, Make approximation wrong (current), Report error?
+        }
+    }
+
+    /// Finds the index of the node that represents or approximates the `find` region.
+    /// If the exact region is found, `Ok` is returned. If it is an approximation, returns `Err`.
+    #[inline]
+    fn find_node_index(&self, find: ChunkRegion) -> Result<u32, u32> {
+        // SAFETY: This must always be valid. (And 0 always is).
+        let mut idx = 0;
+        let mut lod_layer = Lod::MAX.0;
+        while lod_layer > find.lod.0 {
+            lod_layer -= 1;
+            let layer_split = (find.loc.x >> lod_layer)
+                + ((find.loc.y >> lod_layer) << 1)
+                + ((find.loc.z >> lod_layer) << 2);
+            // SAFETY: Index is always valid.
+            let node = unsafe { self.tree.get_unchecked(idx as usize) };
+            match node.children() {
+                Some(children) => {
+                    idx = children.get() + layer_split as u32;
+                }
+                None => return Err(idx),
+            }
+        }
+        Ok(idx)
+    }
+
+    /// Finds the index of the node that represents or approximates the `find` region.
+    /// If the exact region is found, `Ok` is returned. If it is an approximation, returns `Err`.
+    #[inline]
+    fn find_or_make_node_index(&mut self, find: ChunkRegion) -> u32 {
+        // SAFETY: This must always be valid. (And 0 always is).
+        let mut idx = 0;
+        let mut lod_layer = Lod::MAX.0;
+        while lod_layer > find.lod.0 {
+            lod_layer -= 1;
+            let layer_split = (find.loc.x >> lod_layer)
+                + ((find.loc.y >> lod_layer) << 1)
+                + ((find.loc.z >> lod_layer) << 2);
+            // SAFETY: Index is always valid.
+            let node = unsafe { *self.tree.get_unchecked(idx as usize) };
+            let children = match node.children() {
+                Some(children) => children.get(),
+                None => {
+                    // We need to create a new block of 8 nodes.
+                    // We use the approximation of the parent node for their data.
+                    match self.index_to_free {
+                        Some(new_children_index) => {
+                            // SAFETY: This index is valid
+                            let child = unsafe {
+                                self.tree
+                                    .get_unchecked_mut(new_children_index.get() as usize)
+                            };
+                            self.index_to_free = NonZero::new(child.meta);
+                            *child = node;
+                            for child_offset in 1..8 {
+                                // SAFETY: This index is valid
+                                unsafe {
+                                    *self.tree.get_unchecked_mut(
+                                        (new_children_index.get() + child_offset) as usize,
+                                    ) = node;
+                                };
+                            }
+                            new_children_index.get()
+                        }
+                        None => {
+                            let new_children_index = self.tree.len() as u32;
+                            for _ in 0..8 {
+                                self.tree.push(node);
+                            }
+                            new_children_index
+                        }
+                    }
+                }
+            };
+            idx = children + layer_split as u32;
+        }
+        idx
     }
 }
 
@@ -514,12 +581,22 @@ impl ChunkLocation {
     }
 }
 
-struct ChunkChanges {}
+/// Represents a particular region within a [`Chunk`].
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[repr(align(4))] // To treat as a u32.
+pub struct ChunkRegion {
+    lod: Lod,
+    // Each chunk is 256 voxels wide, so this is exactly the right space.
+    loc: U8Vec3,
+}
+
+struct ChunkChanges(Vec<(ChunkRegion, VoxelData)>);
 
 /// Manages a cubic block of [`VoxelData`].
 pub struct ChunkManager {
-    location: ChunkLocation,
-    tree: Arc<ChunkTree>,
+    /// This is the prime reference, the source of truth.
+    chunk: ChunkReference,
+    // TODO: In the future, maybe also support arrays of data for a region.
     changes: ChunkChanges,
 }
 
@@ -530,17 +607,54 @@ impl ChunkManager {
     /// Creates a [`Chunk`] at a particular `location`, based on an `approximation` of the whole chunk.
     pub fn new(location: ChunkLocation, approximation: VoxelData) -> Self {
         Self {
-            location,
-            tree: Arc::new(ChunkTree {
-                tree: vec![ChunkNode {
-                    voxel_data: approximation,
-                    meta: 0,
-                }],
-                index_to_free: None,
-            }),
-            changes: ChunkChanges {},
+            chunk: ChunkReference {
+                location,
+                tree: Arc::new(ChunkTree {
+                    tree: vec![ChunkNode {
+                        voxel_data: approximation,
+                        meta: 0,
+                    }],
+                    index_to_free: None,
+                }),
+            },
+            changes: ChunkChanges(Vec::new()),
         }
     }
+
+    /// Attempts to apply any changes staged in the manager.
+    /// Returns true if successful.
+    pub fn try_apply_changes(&mut self) -> bool {
+        match Arc::get_mut(&mut self.chunk.tree) {
+            Some(chunk) => {
+                chunk.apply_changes(&mut self.changes);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Applies any changes to the chunk immediately.
+    /// This may clone the chunk's data and will not affect any current references to the chunk.
+    /// Returns true if there are other references to this chunk.
+    pub fn force_apply_changes(&mut self) {
+        Arc::make_mut(&mut self.chunk.tree).apply_changes(&mut self.changes);
+    }
+
+    /// Creates a shared reference to this chunk.
+    /// While this reference exists, mutating the chunk will be harder,
+    /// so don't hold onto it for longer than needed.
+    pub fn reference(&self) -> ChunkReference {
+        self.chunk.clone()
+    }
+}
+
+/// Represents a shared reference to a chunk.
+/// This is a snapshot of chunk data.
+/// Holding onto this will make it harder to change the chunk, so don't keep it around longer than you need to.
+#[derive(Clone)]
+pub struct ChunkReference {
+    tree: Arc<ChunkTree>,
+    location: ChunkLocation,
 }
 
 #[cfg(test)]
