@@ -71,6 +71,8 @@ struct ChunkNode {
     /// This contains most other metadata about the node.
     /// The least significant 25 bits store the index to the child nodes.
     /// Since the root node is always index 0, if these 25 bits are 0, there are no children.
+    /// The child index always ends in 0b001.
+    ///
     /// The other 7 bits in order of most to least significant are as follows:
     ///
     /// If it is a leaf node:
@@ -104,6 +106,7 @@ impl ChunkNode {
     };
 
     /// Gets the index of the first of 8 children (stored densely) if it is a parent node.
+    /// The child index always ends in 0b001.
     #[inline]
     fn children(self) -> Option<NonZero<u32>> {
         NonZero::new(self.meta & Self::CHILDREN_INDEX_BITS)
@@ -144,6 +147,7 @@ impl ChunkNode {
 struct ChunkTree {
     tree: Vec<ChunkNode>,
     /// Points to a region of 8 free nodes, or `None` if none are free.
+    /// This should end in 0b001 if some.
     index_to_free: Option<NonZero<u32>>,
 }
 
@@ -397,13 +401,47 @@ impl ChunkTree {
             let node_index = self.find_or_make_node_index(loc);
             // SAFETY: This index is correct.
             let node = unsafe { self.tree.get_unchecked_mut(node_index as usize) };
+            let children = node.children();
             node.voxel_data = data;
-            // TODO: What if this node is a parent? Silently ignore, Delete children, Make approximation wrong (current), Report error?
+            node.set_exact_to(loc.lod);
+
+            if let Some(children) = children {
+                // SAFETY: This index is valid.
+                unsafe {
+                    self.delete_node_group(children.get());
+                }
+            }
+        }
+    }
+
+    /// Deletes the 8 nodes starting at `first_node_index` and all their children.
+    /// These indices may be reused in future.
+    ///
+    /// # Safety:
+    ///
+    /// `first_node_index` must be valid and end in 0b001.
+    unsafe fn delete_node_group(&mut self, first_node_index: u32) {
+        // SAFETY: Caller ensures this is valid and we only use it on self.
+        let mut iterator = unsafe { ChunkNodeIterator::start_at(first_node_index) };
+        while let Some(node_index) = iterator.progress_next_node_depth_first(self) {
+            if node_index.get() & 0b111 != 1 {
+                // Not the first index.
+                continue;
+            }
+            // SAFETY: This index is valid.
+            let node = unsafe { self.tree.get_unchecked_mut(node_index.get() as usize) };
+            // Even though we are changing the meta here, iterating never re-fetches a meta, so it's fine.
+            node.meta = match self.index_to_free {
+                Some(non_zero) => non_zero.get(),
+                None => 0,
+            };
+            self.index_to_free = Some(node_index);
         }
     }
 
     /// Finds the index of the node that represents or approximates the `find` region.
     /// If the exact region is found, `Ok` is returned. If it is an approximation, returns `Err`.
+    /// The index will be valid.
     #[inline]
     fn find_node_index(&self, find: ChunkRegion) -> Result<u32, u32> {
         // SAFETY: This must always be valid. (And 0 always is).
@@ -426,8 +464,9 @@ impl ChunkTree {
         Ok(idx)
     }
 
-    /// Finds the index of the node that represents or approximates the `find` region.
-    /// If the exact region is found, `Ok` is returned. If it is an approximation, returns `Err`.
+    /// Finds the index of the node that represents `find` region.
+    /// If one does not exist, it is created.
+    /// The index will be valid.
     #[inline]
     fn find_or_make_node_index(&mut self, find: ChunkRegion) -> u32 {
         // SAFETY: This must always be valid. (And 0 always is).
@@ -517,6 +556,7 @@ impl ChunkNodeIterator {
 
     /// Finds the next node in a depth first search.
     /// This is guaranteed to return a valid index in the tree.
+    #[inline]
     fn progress_next_node_depth_first(&mut self, tree: &ChunkTree) -> Option<NonZero<u32>> {
         let c = *self.0.last()?;
         // SAFETY: These indices are valid.
