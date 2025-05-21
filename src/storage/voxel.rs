@@ -3,6 +3,7 @@
 use core::fmt::{Debug, Formatter};
 
 use arrayvec::ArrayVec;
+use bevy_math::{IVec3, UVec3};
 
 /// Represents a distinct layer of voxel data. Ex: Void, Air, Liquid, Solid, etc.
 ///
@@ -339,6 +340,34 @@ impl Debug for VoxelData {
             self.fullness(),
             self.0
         )
+    }
+}
+
+/// Represents the location of a voxel.
+///
+/// Internally, it is more efficient to use unsigned coordinates, but externally, signed coordinates are more convenient.
+/// This type bridges that gap.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct VoxelLocation(UVec3);
+
+impl VoxelLocation {
+    const MAPPER: u32 = 1 << 31;
+
+    /// Gets the [`VoxelLocation`] of the voxel at `loc`.
+    pub fn of_location(loc: IVec3) -> Self {
+        Self(loc.as_uvec3() ^ Self::MAPPER)
+    }
+
+    /// Returns the location of the voxel as a [`IVec3`]
+    #[inline]
+    pub fn location(self) -> IVec3 {
+        (self.0 ^ Self::MAPPER).as_ivec3()
+    }
+
+    /// Returns the location of the voxel mapped to a [`UVec3`]
+    #[inline]
+    pub fn location_mapped(self) -> UVec3 {
+        self.0
     }
 }
 

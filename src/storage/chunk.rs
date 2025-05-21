@@ -3,11 +3,13 @@
 use core::num::NonZero;
 
 use arrayvec::ArrayVec;
-use bevy_math::IVec3;
+use bevy_math::{IVec3, UVec3};
 use bevy_platform::prelude::*;
 use thiserror::Error;
 
 use crate::storage::voxel::VoxelData;
+
+use super::voxel::VoxelLocation;
 
 /// Represents a level of detail or layer of octree.
 /// This value must be in range 0..=[`Lod::MAX`], 0 meaning an exact voxel, max meaning an entire chunk.
@@ -160,7 +162,7 @@ impl ChunkNode {
 ///
 /// This must always have the root node at index 0.
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub struct ChunkTree {
+struct ChunkTree {
     tree: Vec<ChunkNode>,
     index_to_free: Option<NonZero<u32>>,
 }
@@ -199,7 +201,7 @@ impl ChunkTree {
 
     /// Compresses this chunk data into a very dense form.
     /// This is mainly used for serialization, but is generally useful for compressing data as needed.
-    pub fn compress(&self) -> Vec<u8> {
+    fn compress(&self) -> Vec<u8> {
         let mut data = Vec::new();
         // Parent nodes only need 4 bytes.
         // Leaf nodes take 5 bytes (4 for voxel data, 1 for exactness).
@@ -243,7 +245,7 @@ impl ChunkTree {
 
     /// Expands chunk data from a very dense form.
     /// This is mainly used for deserialization, but is generally useful for restoring [`Self::compress`]ed data as needed.
-    pub fn expand(compressed: &[u8]) -> Result<Self, ChunkExpansionError> {
+    fn expand(compressed: &[u8]) -> Result<Self, ChunkExpansionError> {
         fn next_u32(buff: &mut impl Iterator<Item = u8>) -> Result<u32, ChunkExpansionError> {
             Ok(u32::from_be_bytes([
                 buff.next()
@@ -496,15 +498,45 @@ impl ChunkNodeIterator {
     }
 }
 
+/// Represents the location of a [`Chunk`].
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct ChunkLocation(UVec3);
+
+impl ChunkLocation {
+    /// Gets the [`ChunkLocation`] of the chunk that contains `voxel`.
+    pub fn of_location(voxel: VoxelLocation) -> Self {
+        Self((voxel.location_mapped() >> Lod::MAX.0) << Lod::MAX.0)
+    }
+
+    #[inline]
+    fn least_corner_location(self) -> UVec3 {
+        self.0
+    }
+}
+
 /// Represents a cubic block of [`VoxelData`].
 pub struct Chunk {
-    ldb_loc: IVec3,
+    location: ChunkLocation,
     tree: ChunkTree,
 }
 
 impl Chunk {
     /// This is the length of the cube that the [`Chunk`] represents.
     pub const CHUNK_SIZE: u32 = Lod::MAX.length();
+
+    /// Creates a [`Chunk`] at a particular `location`, based on an `approximation` of the whole chunk.
+    pub fn new(location: ChunkLocation, approximation: VoxelData) -> Self {
+        Self {
+            location,
+            tree: ChunkTree {
+                tree: vec![ChunkNode {
+                    voxel_data: approximation,
+                    meta: 0,
+                }],
+                index_to_free: None,
+            },
+        }
+    }
 }
 
 #[cfg(test)]
