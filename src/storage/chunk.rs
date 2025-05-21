@@ -3,8 +3,8 @@
 use core::num::NonZero;
 
 use arrayvec::ArrayVec;
-use bevy_math::{IVec3, UVec3};
-use bevy_platform::prelude::*;
+use bevy_math::UVec3;
+use bevy_platform::{prelude::*, sync::Arc};
 use thiserror::Error;
 
 use crate::storage::voxel::VoxelData;
@@ -499,7 +499,7 @@ impl ChunkNodeIterator {
 }
 
 /// Represents the location of a [`Chunk`].
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
 pub struct ChunkLocation(UVec3);
 
 impl ChunkLocation {
@@ -514,13 +514,16 @@ impl ChunkLocation {
     }
 }
 
-/// Represents a cubic block of [`VoxelData`].
-pub struct Chunk {
+struct ChunkChanges {}
+
+/// Manages a cubic block of [`VoxelData`].
+pub struct ChunkManager {
     location: ChunkLocation,
-    tree: ChunkTree,
+    tree: Arc<ChunkTree>,
+    changes: ChunkChanges,
 }
 
-impl Chunk {
+impl ChunkManager {
     /// This is the length of the cube that the [`Chunk`] represents.
     pub const CHUNK_SIZE: u32 = Lod::MAX.length();
 
@@ -528,13 +531,14 @@ impl Chunk {
     pub fn new(location: ChunkLocation, approximation: VoxelData) -> Self {
         Self {
             location,
-            tree: ChunkTree {
+            tree: Arc::new(ChunkTree {
                 tree: vec![ChunkNode {
                     voxel_data: approximation,
                     meta: 0,
                 }],
                 index_to_free: None,
-            },
+            }),
+            changes: ChunkChanges {},
         }
     }
 }

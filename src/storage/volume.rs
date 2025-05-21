@@ -1,9 +1,10 @@
 //! Contains the logic for specifying collections of [`Chunk`]s
 
-use bevy_math::IVec3;
-use bevy_platform::collections::HashMap;
+use bevy_platform::{collections::HashMap, sync::Arc};
 
-use crate::storage::chunk::Chunk;
+use crate::storage::chunk::ChunkManager;
+
+use super::chunk::ChunkLocation;
 
 /// Represents a collection of [`Chunk`]s and how to mutate them.
 /// All data is specified externally and arbitrarily.
@@ -24,6 +25,5 @@ use crate::storage::chunk::Chunk;
 /// This is a long process that requires holding onto relevant chunk information, which would cause mutations to be queued.
 /// Allowing arbitrary meshes to be constructed like this empowers configuring caching, quality, and speed of mesh generation.
 pub struct Volume {
-    chunks: HashMap<IVec3, Chunk>,
-    // changes: tbd
+    chunks: HashMap<ChunkLocation, ChunkManager>,
 }

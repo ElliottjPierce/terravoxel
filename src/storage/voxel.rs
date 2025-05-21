@@ -347,7 +347,7 @@ impl Debug for VoxelData {
 ///
 /// Internally, it is more efficient to use unsigned coordinates, but externally, signed coordinates are more convenient.
 /// This type bridges that gap.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
 pub struct VoxelLocation(UVec3);
 
 impl VoxelLocation {
