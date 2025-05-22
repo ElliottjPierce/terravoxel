@@ -8,13 +8,21 @@ bevy_math = { version = "0.16", default-features = false, features = ["curve"] }
 bevy_mesh = { version = "0.16", default-features = false }
 bevy_render = { version = "0.16", default-features = false }
 bevy_pbr = { version = "0.16", default-features = false }
-bevy_platform = { version = "0.16", default-features = false, features = ["std"] }
-arrayvec = {version = "0.7.6", default-features = false }
+bevy_platform = { version = "0.16", default-features = false }
+arrayvec = { version = "0.7.6", default-features = false }
 thiserror = "2.0.12"
+serde = { version = "1", default-features = false, features = [
+  "derive",
+], optional = true }
 
 [dev-dependencies]
 # for examples
 bevy = "0.16"
+
+[features]
+default = ["std", "serialize"]
+std = ["bevy_platform/std", "serde?/std"]
+serialize = ["dep:serde", "bevy_math/serialize"]
 
 [profile.dev]
 opt-level = 3
