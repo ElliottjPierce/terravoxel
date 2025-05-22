@@ -1,6 +1,6 @@
 //! Contains the logic for specifying bulk [`VoxelData`].
 
-use core::num::NonZero;
+use core::{mem::MaybeUninit, num::NonZero};
 
 use arrayvec::ArrayVec;
 use bevy_math::{U8Vec3, UVec3};
@@ -446,43 +446,73 @@ impl ChunkTree {
     }
 
     /// Cleans up recursively any changes done in [`Self::apply_changes`] to nodes at or under (as children) `node_idx`.
-    /// This both sets and returns the data, and it returns if the data is different than before the [`Self::apply_changes`].
+    /// This both sets and returns the data.
+    /// This also returns the `u8` depth of children under the node if its data changed.
+    /// If its data didn't change, this is `u8::MAX`.
     ///
     /// # Safety
     ///
     /// `node_idx` must be valid.
-    unsafe fn re_approximate_data_under(&mut self, node_idx: u32) -> (VoxelData, bool) {
+    unsafe fn re_approximate_data_under(&mut self, node_idx: u32) -> (VoxelData, u8) {
         // SAFETY: Caller ensures index is valid
         let node = unsafe { self.tree.get_unchecked_mut(node_idx as usize) };
 
         if !node.is_changed() {
-            return (node.voxel_data, false);
+            return (node.voxel_data, u8::MAX);
         }
         node.clear_changed();
 
         let Some(children) = node.children() else {
-            return (node.voxel_data, true);
+            return (node.voxel_data, 0);
         };
 
         let current_data = node.voxel_data;
         let mut any_changed = false;
-        // SAFETY: All these node indices are valid.
-        let data_to_approximate = core::array::from_fn(|child_idx| unsafe {
-            let (data, changed) = self.re_approximate_data_under(children.get() + child_idx as u32);
-            any_changed |= changed;
+        let mut max_child_depth = 0;
+        let mut one_data = MaybeUninit::uninit();
+        let mut children_unique = false;
+        let data_to_approximate = core::array::from_fn(|child_idx| {
+            // SAFETY: All these node indices are valid.
+            let (data, child_depth_if_changed) =
+                unsafe { self.re_approximate_data_under(children.get() + child_idx as u32) };
+            if child_idx == 0 {
+                one_data.write(data);
+            } else {
+                // SAFETY: The first index is 0.
+                children_unique |= unsafe { one_data.assume_init_read() } != data;
+            }
+            any_changed |= child_depth_if_changed != u8::MAX;
+            max_child_depth = max_child_depth.max(child_depth_if_changed);
             data
         });
 
         if !any_changed {
-            return (current_data, false);
+            return (current_data, u8::MAX);
         }
 
-        let new_data = VoxelData::approximate(data_to_approximate);
-        let is_new = current_data != new_data;
-        // SAFETY: Caller ensures index is valid
-        let node = unsafe { self.tree.get_unchecked_mut(node_idx as usize) };
-        node.voxel_data = new_data;
-        (new_data, is_new)
+        if children_unique || max_child_depth > 0 {
+            let new_data = VoxelData::approximate(data_to_approximate);
+            // SAFETY: Caller ensures index is valid
+            let node = unsafe { self.tree.get_unchecked_mut(node_idx as usize) };
+            node.voxel_data = new_data;
+            (
+                new_data,
+                if new_data == current_data {
+                    u8::MAX
+                } else {
+                    max_child_depth
+                },
+            )
+        } else {
+            // SAFETY: This is made init when calculating children's data
+            let new_data = unsafe { one_data.assume_init() };
+            // SAFETY: Caller ensures index is valid
+            let node = unsafe { self.tree.get_unchecked_mut(node_idx as usize) };
+            node.voxel_data = new_data;
+            // SAFETY: This is directly from a node's children.
+            unsafe { self.delete_node(children.get()) };
+            (new_data, if new_data == current_data { u8::MAX } else { 0 })
+        }
     }
 
     /// Deletes the 8 nodes starting at `first_node_index` and all their children.
@@ -499,15 +529,33 @@ impl ChunkTree {
                 // Not the first index.
                 continue;
             }
-            // SAFETY: This index is valid.
-            let node = unsafe { self.tree.get_unchecked_mut(node_index.get() as usize) };
-            // Even though we are changing the meta here, iterating never re-fetches a meta, so it's fine.
-            node.meta = match self.index_to_free {
-                Some(non_zero) => non_zero.get(),
-                None => 0,
-            };
-            self.index_to_free = Some(node_index);
+            // SAFETY: The ending was just checked and the index came from a trusted source.
+            unsafe {
+                self.delete_node(node_index.get());
+            }
         }
+        // SAFETY: Ensured by caller.
+        unsafe {
+            self.delete_node(first_node_index);
+        }
+    }
+
+    /// Deletes the 8 nodes starting at `first_node_index`.
+    /// These indices may be reused in future.
+    ///
+    /// # Safety:
+    ///
+    /// `first_node_index` must be valid and end in 0b001.
+    #[inline]
+    unsafe fn delete_node(&mut self, first_node_index: u32) {
+        // SAFETY: Caller ensures this index is valid.
+        let node = unsafe { self.tree.get_unchecked_mut(first_node_index as usize) };
+        node.meta = match self.index_to_free {
+            Some(non_zero) => non_zero.get(),
+            None => 0,
+        };
+        // SAFETY: Caller ensures this ends in a 1.
+        self.index_to_free = unsafe { Some(NonZero::new_unchecked(first_node_index)) };
     }
 
     /// Finds the index of the node that represents or approximates the `find` region.
