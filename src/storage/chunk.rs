@@ -5,7 +5,6 @@ use core::num::NonZero;
 use arrayvec::ArrayVec;
 use bevy_math::{U8Vec3, UVec3};
 use bevy_platform::{prelude::*, sync::Arc};
-use fixedbitset::FixedBitSet;
 use thiserror::Error;
 
 use crate::storage::voxel::VoxelData;
@@ -78,11 +77,14 @@ struct ChunkNode {
     /// If it is a leaf node:
     ///
     /// - 4 bits for the [`Lod`] to which this [`VoxelData`] is precise to (If this lod or higher is requested, we can use this data exactly),
-    /// - 3 bits currently unused,
+    /// - 1 bit marking the node as changed directly during [`ChunkTree::apply_changes`],
+    /// - 2 bits currently unused,
     ///
     /// If it is a parent node:
     ///
-    /// - 7 bits currently unused,
+    /// - 4 bits currently unused,
+    /// - 1 bit marking the node as having a changed descendant during [`ChunkTree::apply_changes`],
+    /// - 2 bits currently unused,
     ///
     /// If this is not a node and is "free", this just stores the index to the next free node, or 0 if there is no free node.
     ///
@@ -94,7 +96,7 @@ struct ChunkNode {
 
 impl ChunkNode {
     const CHILDREN_INDEX_BITS: u32 = (1u32 << 25) - 1;
-    const DIRTY_BIT: u32 = 1 << 31;
+    const CHANGED_BIT: u32 = 1 << 27;
     const EXACTNESS_SHIFT: u32 = 28;
     const EXACTNESS_BITS: u32 = 0b1111 << Self::EXACTNESS_SHIFT;
 
@@ -118,6 +120,25 @@ impl ChunkNode {
     #[inline]
     fn set_children(&mut self, children_index: u32) {
         self.meta = children_index;
+    }
+
+    /// Returns true if this data (for leaf nodes) or one of its descendants (for parent nodes) has been changed.
+    /// This is used as a temporary flag in [`ChunkTree::apply_changes`].
+    #[inline]
+    fn is_changed(self) -> bool {
+        self.meta & Self::CHANGED_BIT > 0
+    }
+
+    /// Sets [`Self::is_changed`] to true.
+    #[inline]
+    fn mark_changed(&mut self) {
+        self.meta |= Self::CHANGED_BIT;
+    }
+
+    /// Sets [`Self::is_changed`] to false.
+    #[inline]
+    fn clear_changed(&mut self) {
+        self.meta &= !Self::CHANGED_BIT;
     }
 
     /// If this is a leaf node, returns the [`Lod`] to which this [`ChunkNode::voxel_data`] is exact.
@@ -398,12 +419,17 @@ impl ChunkTree {
     /// Applies all changes in these changes, creating new nodes as needed.
     fn apply_changes(&mut self, changes: &mut ChunkChanges) {
         for (loc, data) in changes.0.drain(..) {
-            let node_index = self.find_or_make_node_index(loc);
+            let node_index = self.find_or_make_node_index(loc, ChunkNode::mark_changed);
             // SAFETY: This index is correct.
             let node = unsafe { self.tree.get_unchecked_mut(node_index as usize) };
             let children = node.children();
+            let same_data = node.voxel_data == data;
             node.voxel_data = data;
             node.set_exact_to(loc.lod);
+
+            if !same_data {
+                node.mark_changed();
+            }
 
             if let Some(children) = children {
                 // SAFETY: This index is valid.
@@ -412,6 +438,51 @@ impl ChunkTree {
                 }
             }
         }
+
+        // SAFETY: 0 is always valid
+        unsafe {
+            self.re_approximate_data_under(0);
+        }
+    }
+
+    /// Cleans up recursively any changes done in [`Self::apply_changes`] to nodes at or under (as children) `node_idx`.
+    /// This both sets and returns the data, and it returns if the data is different than before the [`Self::apply_changes`].
+    ///
+    /// # Safety
+    ///
+    /// `node_idx` must be valid.
+    unsafe fn re_approximate_data_under(&mut self, node_idx: u32) -> (VoxelData, bool) {
+        // SAFETY: Caller ensures index is valid
+        let node = unsafe { self.tree.get_unchecked_mut(node_idx as usize) };
+
+        if !node.is_changed() {
+            return (node.voxel_data, false);
+        }
+        node.clear_changed();
+
+        let Some(children) = node.children() else {
+            return (node.voxel_data, true);
+        };
+
+        let current_data = node.voxel_data;
+        let mut any_changed = false;
+        // SAFETY: All these node indices are valid.
+        let data_to_approximate = core::array::from_fn(|child_idx| unsafe {
+            let (data, changed) = self.re_approximate_data_under(children.get() + child_idx as u32);
+            any_changed |= changed;
+            data
+        });
+
+        if !any_changed {
+            return (current_data, false);
+        }
+
+        let new_data = VoxelData::approximate(data_to_approximate);
+        let is_new = current_data != new_data;
+        // SAFETY: Caller ensures index is valid
+        let node = unsafe { self.tree.get_unchecked_mut(node_idx as usize) };
+        node.voxel_data = new_data;
+        (new_data, is_new)
     }
 
     /// Deletes the 8 nodes starting at `first_node_index` and all their children.
@@ -468,7 +539,11 @@ impl ChunkTree {
     /// If one does not exist, it is created.
     /// The index will be valid.
     #[inline]
-    fn find_or_make_node_index(&mut self, find: ChunkRegion) -> u32 {
+    fn find_or_make_node_index(
+        &mut self,
+        find: ChunkRegion,
+        mut on_parents: impl FnMut(&mut ChunkNode),
+    ) -> u32 {
         // SAFETY: This must always be valid. (And 0 always is).
         let mut idx = 0;
         let mut lod_layer = Lod::MAX.0;
@@ -478,7 +553,9 @@ impl ChunkTree {
                 + ((find.loc.y >> lod_layer) << 1)
                 + ((find.loc.z >> lod_layer) << 2);
             // SAFETY: Index is always valid.
-            let node = unsafe { *self.tree.get_unchecked(idx as usize) };
+            let node = unsafe { self.tree.get_unchecked_mut(idx as usize) };
+            on_parents(node);
+            let node = *node;
             let children = match node.children() {
                 Some(children) => children.get(),
                 None => {

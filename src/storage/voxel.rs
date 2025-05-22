@@ -248,7 +248,7 @@ impl VoxelData {
     }
 
     /// Creates an approximate [`VoxelData`] for this cluster of data.
-    fn approximate(cluster: [Self; 8]) -> Self {
+    pub fn approximate(cluster: [Self; 8]) -> Self {
         let mut highest_layer = VoxelLayer(0);
         let mut next_highest_layer = VoxelLayer(0);
 
