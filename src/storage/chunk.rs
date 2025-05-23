@@ -1,6 +1,6 @@
 //! Contains the logic for specifying bulk [`VoxelData`].
 
-use core::{mem::MaybeUninit, num::NonZero};
+use core::{mem::MaybeUninit, num::NonZero, ops::Deref};
 
 use arrayvec::ArrayVec;
 use bevy_math::{U8Vec3, UVec3};
@@ -114,14 +114,6 @@ impl ChunkNode {
         NonZero::new(self.meta & Self::CHILDREN_INDEX_BITS)
     }
 
-    /// This sets [`Self::children`].
-    /// If `children_index` is 0, this makes this a leaf node, and [`Self::set_exact_to`] should be called immediately.
-    /// If `children_index` is not 0, this makes this a parent node, and [`Self::is_dirty`] should be set immediately.
-    #[inline]
-    fn set_children(&mut self, children_index: u32) {
-        self.meta = children_index;
-    }
-
     /// Returns true if this data (for leaf nodes) or one of its descendants (for parent nodes) has been changed.
     /// This is used as a temporary flag in [`ChunkTree::apply_changes`].
     #[inline]
@@ -159,13 +151,22 @@ impl ChunkNode {
     }
 }
 
-/// Represents a octree of [`ChunkNode`]s.
+/// Represents a chunk of [`VoxelData`].
+/// Because large worlds or small voxels require vast amounts of memory,
+/// worlds must be chunked to be efficiently streamed, loaded, stored on disk, sent across the network, etc.
+/// Conceptually, this is like a 3d array of [`VoxelData`].
 ///
-/// # Safety
-///
-/// This must always have the root node at index 0.
+/// To minimize memory consumption, this is actually implemented as a sparse voxel octree.
+/// Chunks with more similar voxels more local to each other will take less memory.
+/// A truly "random" chunk would use only slightly more memory than an array,
+/// and a traditional chunk shape with patterns (ex: horizons, groupings of like voxels, etc) will need much less memory.
 #[derive(Debug, PartialEq, Eq, Clone)]
-struct ChunkTree {
+pub struct ChunkTree {
+    /// Contains the primary storage of [`VoxelData`] in the chunk, an octree of [`ChunkNode`]s.
+    ///
+    /// # Safety
+    ///
+    /// This must always have the root node at index 0.
     tree: Vec<ChunkNode>,
     /// Points to a region of 8 free nodes, or `None` if none are free.
     /// This should end in 0b001 if some.
@@ -206,7 +207,7 @@ impl ChunkTree {
 
     /// Compresses this chunk data into a very dense form.
     /// This is mainly used for serialization, but is generally useful for compressing data as needed.
-    fn compress(&self) -> Vec<u8> {
+    pub fn compress(&self) -> Vec<u8> {
         let mut data = Vec::new();
         // Parent nodes only need 4 bytes.
         // Leaf nodes take 5 bytes (4 for voxel data, 1 for exactness).
@@ -250,7 +251,7 @@ impl ChunkTree {
 
     /// Expands chunk data from a very dense form.
     /// This is mainly used for deserialization, but is generally useful for restoring [`Self::compress`]ed data as needed.
-    fn expand(compressed: &[u8]) -> Result<Self, ChunkExpansionError> {
+    pub fn expand(compressed: &[u8]) -> Result<Self, ChunkExpansionError> {
         fn next_u32(buff: &mut impl Iterator<Item = u8>) -> Result<u32, ChunkExpansionError> {
             Ok(u32::from_be_bytes([
                 buff.next()
@@ -740,9 +741,11 @@ impl ChunkLocation {
         Self((voxel.location_mapped() >> Lod::MAX.0) << Lod::MAX.0)
     }
 
+    /// Represents the location of a chunk by the location of the voxel in its least corner.
+    /// This is the corner that is farthest left, down, and back.
     #[inline]
-    fn least_corner_location(self) -> UVec3 {
-        self.0
+    pub fn least_corner_location(self) -> VoxelLocation {
+        VoxelLocation(self.0)
     }
 }
 
@@ -755,13 +758,13 @@ pub struct ChunkRegion {
     loc: U8Vec3,
 }
 
+// TODO: In the future, maybe also support arrays of data for a region.
 struct ChunkChanges(Vec<(ChunkRegion, VoxelData)>);
 
 /// Manages a cubic block of [`VoxelData`].
 pub struct ChunkManager {
     /// This is the prime reference, the source of truth.
     chunk: ChunkReference,
-    // TODO: In the future, maybe also support arrays of data for a region.
     changes: ChunkChanges,
 }
 
@@ -770,17 +773,11 @@ impl ChunkManager {
     pub const CHUNK_SIZE: u32 = Lod::MAX.length();
 
     /// Creates a [`Chunk`] at a particular `location`, based on an `approximation` of the whole chunk.
-    pub fn new(location: ChunkLocation, approximation: VoxelData) -> Self {
+    pub fn new(location: ChunkLocation, data: ChunkTree) -> Self {
         Self {
             chunk: ChunkReference {
                 location,
-                tree: Arc::new(ChunkTree {
-                    tree: vec![ChunkNode {
-                        voxel_data: approximation,
-                        meta: 0,
-                    }],
-                    index_to_free: None,
-                }),
+                tree: Arc::new(data),
             },
             changes: ChunkChanges(Vec::new()),
         }
@@ -811,6 +808,27 @@ impl ChunkManager {
     pub fn reference(&self) -> ChunkReference {
         self.chunk.clone()
     }
+
+    /// Gets a  mutable reference to the raw [`ChunkTree`] if no other references exist.
+    /// This is particularly useful for high performance, low-level interactions.
+    pub fn try_get_raw_mut(&mut self) -> Option<&mut ChunkTree> {
+        Arc::get_mut(&mut self.chunk.tree)
+    }
+
+    /// Gets a  mutable reference to the raw [`ChunkTree`], cloning it if other references exist.
+    /// This is particularly useful for high performance, low-level interactions.
+    pub fn force_get_raw_mut(&mut self) -> &mut ChunkTree {
+        Arc::make_mut(&mut self.chunk.tree)
+    }
+}
+
+impl Deref for ChunkManager {
+    type Target = ChunkReference;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.chunk
+    }
 }
 
 /// Represents a shared reference to a chunk.
@@ -820,6 +838,21 @@ impl ChunkManager {
 pub struct ChunkReference {
     tree: Arc<ChunkTree>,
     location: ChunkLocation,
+}
+
+impl ChunkReference {
+    /// Returns the location of this particular chunk.
+    #[inline]
+    pub fn chunk_location(&self) -> ChunkLocation {
+        self.location
+    }
+
+    /// Gets a reference to the raw [`ChunkTree`].
+    /// This is particularly useful for high performance, low-level interactions.
+    #[inline]
+    pub fn get_raw(&self) -> &ChunkTree {
+        &self.tree
+    }
 }
 
 #[cfg(test)]
