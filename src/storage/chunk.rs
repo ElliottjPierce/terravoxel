@@ -29,7 +29,8 @@ impl Lod {
         1u32 << self.0 as u32
     }
 
-    const fn try_from_index(index: u8) -> Option<Self> {
+    /// Constructs an [`Lod`] form its index if that index corresponds to a valid lod.
+    pub const fn try_from_index(index: u8) -> Option<Self> {
         if index <= Self::MAX.0 {
             Some(Self(index))
         } else {
@@ -96,9 +97,7 @@ struct ChunkNode {
 
 impl ChunkNode {
     const CHILDREN_INDEX_BITS: u32 = (1u32 << 25) - 1;
-    const CHANGED_BIT: u32 = 1 << 27;
-    const EXACTNESS_SHIFT: u32 = 28;
-    const EXACTNESS_BITS: u32 = 0b1111 << Self::EXACTNESS_SHIFT;
+    const CHANGED_BIT: u32 = 1 << 31;
 
     /// Since this is a tree, we never iterate the chunk's list, but there are sometimes gaps.
     /// This is a dummy value that can be used as a placeholder.
@@ -131,23 +130,6 @@ impl ChunkNode {
     #[inline]
     fn clear_changed(&mut self) {
         self.meta &= !Self::CHANGED_BIT;
-    }
-
-    /// If this is a leaf node, returns the [`Lod`] to which this [`ChunkNode::voxel_data`] is exact.
-    /// Higher (less detailed/bigger) lods can use this value exactly.
-    /// Lower (more detailed/smaller) lods should prefer to fetch a new sample.
-    ///
-    /// If this is not a leaf node, this result is meaningless.
-    /// It is still safe, but using it as correct is a logic error.
-    #[inline]
-    fn exact_to(self) -> Lod {
-        Lod((self.meta >> Self::EXACTNESS_SHIFT) as u8)
-    }
-
-    /// Sets [`Self::exact_to`], making this a leaf node.
-    #[inline]
-    fn set_exact_to(&mut self, value: Lod) {
-        self.meta = (value.0 as u32) << Self::EXACTNESS_SHIFT;
     }
 }
 
@@ -209,14 +191,11 @@ impl ChunkTree {
     /// This is mainly used for serialization, but is generally useful for compressing data as needed.
     pub fn compress(&self) -> Vec<u8> {
         let mut data = Vec::new();
-        // Parent nodes only need 4 bytes.
-        // Leaf nodes take 5 bytes (4 for voxel data, 1 for exactness).
-        // Parent nodes take 4 bytes (for child index).
-        // Most nodes will probably be leaves.
+        // Nodes take 4 bytes (either voxel data or child index).
         // Plus four for version.
         // Plus four for length.
-        // This will over allocate, but better than allocating twice.
-        data.reserve_exact(self.tree.len() * 5 + 8);
+        // This will over allocate if there are free nodes, but better than allocating twice.
+        data.reserve_exact(self.tree.len() * 4 + 8);
         data.extend_from_slice(&Self::ENCODER_VERSION.to_be_bytes());
         data.extend_from_slice(&(self.tree.len() as u32).to_be_bytes());
 
@@ -229,7 +208,6 @@ impl ChunkTree {
                 }
                 None => {
                     data.extend_from_slice(&node.voxel_data.to_bits().to_be_bytes());
-                    data.push(node.exact_to().index());
                 }
             }
         }
@@ -279,14 +257,7 @@ impl ChunkTree {
         // It's data
         if first & VoxelData::RESERVED_BIT == 0 {
             let mut tree = Vec::new();
-            let exactness = buff
-                .next()
-                .ok_or(ChunkExpansionError::UnexpectedBufferEnd)?;
             let mut root = ChunkNode::PLACEHOLDER;
-            root.set_exact_to(
-                Lod::try_from_index(exactness)
-                    .ok_or(ChunkExpansionError::InvalidExactness(exactness))?,
-            );
             root.voxel_data = VoxelData::from_bits_unchecked(first); // Reserved bit was off.
             tree.push(root);
 
@@ -338,13 +309,6 @@ impl ChunkTree {
                     // SAFETY: path indices are correct.
                     let node = unsafe { tree.get_unchecked_mut(node_index as usize) };
                     node.meta = 0;
-                    let exactness = buff
-                        .next()
-                        .ok_or(ChunkExpansionError::UnexpectedBufferEnd)?;
-                    node.set_exact_to(
-                        Lod::try_from_index(exactness)
-                            .ok_or(ChunkExpansionError::InvalidExactness(exactness))?,
-                    );
                     node.voxel_data = VoxelData::from_bits_unchecked(bulk); // Reserved bit was off.
 
                     // Now we need to find the next branch to explore
@@ -426,7 +390,6 @@ impl ChunkTree {
             let children = node.children();
             let same_data = node.voxel_data == data;
             node.voxel_data = data;
-            node.set_exact_to(loc.lod);
 
             if !same_data {
                 node.mark_changed();
