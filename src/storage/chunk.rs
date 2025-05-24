@@ -162,7 +162,7 @@ pub enum ChunkExpansionError {
     /// The version number does not correspond to any version ever.
     #[error("The version is not recognized.")]
     InvalidVersion(u32),
-    /// Th stamped length was impossible (0 or really big)
+    /// The stamped length was impossible (0, really big, or not mod 8 == 1)
     #[error("The tree's length stamp is impossible: {0}.")]
     ImpossibleTreeLen(u32),
     /// The compressed buffer was smaller than expected.
